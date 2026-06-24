@@ -166,6 +166,12 @@ class ImpactItem:
         }
 
 
+class SourceStaleError(Exception):
+    def __init__(self, path: Path, message: str):
+        super().__init__(message)
+        self.path = path
+
+
 def clean_text(value: Any) -> str:
     if value is None:
         return ""
@@ -198,6 +204,7 @@ def default_config() -> dict[str, Any]:
             "excel_dir": str(DEFAULT_SOURCE_DIR),
             "store_list_path": str(DEFAULT_STORE_LIST),
             "site": SITE_US,
+            "max_excel_age_hours": 30,
         },
         "dingtalk": {
             "dws_call": str(DEFAULT_DWS_CALL),
@@ -505,6 +512,34 @@ def item_from_detail_row(row: dict[str, str], source_file: str) -> list[ImpactIt
     return items
 
 
+def configured_max_excel_age_hours(config: dict[str, Any]) -> float:
+    raw = config.get("source", {}).get("max_excel_age_hours", 0)
+    if raw in (None, ""):
+        return 0.0
+    try:
+        value = float(raw)
+    except Exception:
+        raise ValueError("source.max_excel_age_hours 必须是数字")
+    if value < 0:
+        raise ValueError("source.max_excel_age_hours 不能小于 0")
+    return value
+
+
+def ensure_excel_source_fresh(config: dict[str, Any], excel_path: Path) -> None:
+    max_age_hours = configured_max_excel_age_hours(config)
+    if max_age_hours <= 0:
+        return
+    modified_at = excel_path.stat().st_mtime
+    age_hours = max(0.0, (time.time() - modified_at) / 3600)
+    if age_hours > max_age_hours:
+        modified_text = datetime.fromtimestamp(modified_at).strftime("%Y-%m-%d %H:%M:%S")
+        raise SourceStaleError(
+            excel_path,
+            f"Excel 数据源已过期: {excel_path}; 最后修改时间 {modified_text}, "
+            f"文件年龄 {age_hours:.1f} 小时, 超过 source.max_excel_age_hours={max_age_hours:g}。",
+        )
+
+
 def load_items_from_excel(path: Path, target_site: str = SITE_US) -> list[ImpactItem]:
     workbook = read_xlsx_workbook(path)
     rows = rows_to_dicts(find_detail_sheet(workbook))
@@ -548,7 +583,7 @@ def load_sample_items() -> list[ImpactItem]:
     ]
 
 
-def load_items(config: dict[str, Any], args: argparse.Namespace) -> tuple[list[ImpactItem], str]:
+def load_items(config: dict[str, Any], args: argparse.Namespace, enforce_freshness: bool = False) -> tuple[list[ImpactItem], str]:
     source = config.get("source", {})
     source_type = args.source_type or source.get("type") or "excel_latest"
     target_site = args.site or source.get("site") or SITE_US
@@ -559,11 +594,15 @@ def load_items(config: dict[str, Any], args: argparse.Namespace) -> tuple[list[I
         return load_sample_items(), "sample"
     if source_type == "excel":
         excel_path = Path(args.source_excel or source.get("excel_path") or "")
+        if enforce_freshness:
+            ensure_excel_source_fresh(config, excel_path)
         items = load_items_from_excel(excel_path, target_site=target_site)
         return items, str(excel_path)
     if source_type == "excel_latest":
         source_dir = Path(args.source_dir or source.get("excel_dir") or DEFAULT_SOURCE_DIR)
         excel_path = find_latest_excel(source_dir)
+        if enforce_freshness:
+            ensure_excel_source_fresh(config, excel_path)
         items = load_items_from_excel(excel_path, target_site=target_site)
         return items, str(excel_path)
     if source_type == "bridge":
@@ -942,6 +981,11 @@ def validate_runtime_config(
     elif source_type == "bridge":
         issues.append(issue("bridge_not_implemented", "bridge 采集入口当前版本尚未接入"))
 
+    try:
+        configured_max_excel_age_hours(config)
+    except Exception as exc:
+        issues.append(issue("source_max_excel_age_hours_invalid", str(exc)))
+
     if config.get("notify", {}).get("require_all_stores_before_send", False):
         store_list_path = Path(source.get("store_list_path") or "")
         if not store_list_path.is_file():
@@ -1294,7 +1338,7 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
         except Exception:
             raise ValueError("max_items_per_message 必须是正整数")
         prune_old_items(conn, retention_days)
-        items, source = load_items(config, args)
+        items, source = load_items(config, args, enforce_freshness=True)
         write_run_start(conn, run_id, started_at, source)
         coverage_summary = build_coverage_summary(config, args, items)
         coverage_error = coverage_failure_message(coverage_summary) if should_require_store_coverage(config, args) else ""
@@ -1342,6 +1386,11 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
                     status = "no_new_items"
                 elif dry_run:
                     status = "dry_run"
+    except SourceStaleError as exc:
+        status = "source_stale"
+        error = str(exc)
+        source = str(exc.path)
+        write_run_start(conn, run_id, started_at, source)
     except Exception as exc:
         status = "failed"
         error = str(exc)

@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -204,6 +205,53 @@ class ExcelEndToEndTests(unittest.TestCase):
             selected = notifier.find_latest_excel(root)
 
             self.assertEqual(selected, source)
+
+    def test_parse_allows_stale_excel_for_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_excel = root / "source.xlsx"
+            output_dir = root / "out"
+            write_single_sheet_xlsx(
+                source_excel,
+                "异常明细",
+                ["店铺", "站点", "异常分类", "原因", "日期", "哪些商品会受到影响？"],
+                [
+                    {
+                        "店铺": "BYF",
+                        "站点": notifier.SITE_US,
+                        "异常分类": "食品和商品安全问题",
+                        "原因": "安全饮用水法案",
+                        "日期": "2026-01-30",
+                        "哪些商品会受到影响？": "ASIN: B0STALE000 SKU: SKU-0000",
+                    }
+                ],
+            )
+            stale_time = time.time() - 7200
+            os.utime(source_excel, (stale_time, stale_time))
+            config = notifier.default_config()
+            config["source"]["type"] = "excel"
+            config["source"]["excel_path"] = str(source_excel)
+            config["source"]["max_excel_age_hours"] = 1
+            config["state"]["result_dir"] = str(output_dir)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="excel",
+                source_excel=str(source_excel),
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                output_dir=str(output_dir),
+                require_all_stores=False,
+            )
+
+            result = notifier.execute_parse(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["total_items"], 1)
 
     def test_parse_missing_excel_returns_failure_report_without_exception(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -573,6 +621,96 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual(attempt_count, 0)
             self.assertEqual(notified_count, 0)
 
+    def test_run_blocks_notification_when_excel_source_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_excel = root / "source.xlsx"
+            store_list = root / "stores.xlsx"
+            dws_call = root / "dws.cmd"
+            stores = [
+                "BYF",
+                "Hangoro",
+                "Naukwan",
+                "Winkear",
+                "Wowkk",
+                "Lexdale",
+                "Kruzoo",
+                "Taucet",
+                "Soebiz",
+                "Wintap",
+                "Jabbol",
+                "Hanallx",
+                "Qinkell",
+                "Artiqua",
+            ]
+            detail_rows = [
+                {
+                    "店铺": store,
+                    "站点": notifier.SITE_US,
+                    "异常分类": "食品和商品安全问题",
+                    "原因": "安全饮用水法案",
+                    "日期": "2026-01-30",
+                    "哪些商品会受到影响？": f"ASIN: B0STALE{index:03d} SKU: SKU-{index:04d}",
+                }
+                for index, store in enumerate(stores)
+            ]
+            write_single_sheet_xlsx(
+                source_excel,
+                "异常明细",
+                ["店铺", "站点", "异常分类", "原因", "日期", "哪些商品会受到影响？"],
+                detail_rows,
+            )
+            stale_time = time.time() - 7200
+            os.utime(source_excel, (stale_time, stale_time))
+            write_single_sheet_xlsx(
+                store_list,
+                "店铺执行清单",
+                ["店铺", "站点"],
+                [{"店铺": store, "站点": notifier.SITE_US} for store in stores],
+            )
+            dws_call.write_text("@echo off\r\necho {\"ok\":true}\r\nexit /b 0\r\n", encoding="utf-8")
+            config = notifier.default_config()
+            config["source"]["type"] = "excel"
+            config["source"]["excel_path"] = str(source_excel)
+            config["source"]["store_list_path"] = str(store_list)
+            config["source"]["max_excel_age_hours"] = 1
+            config["dingtalk"]["dws_call"] = str(dws_call)
+            config["dingtalk"]["send_enabled"] = False
+            config["notify"]["require_all_stores_before_send"] = True
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=False,
+                dry_run=True,
+                send=False,
+            )
+
+            result = notifier.execute_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "source_stale")
+            self.assertEqual(result["notify_candidates"], 0)
+            self.assertIn("Excel", result["error"])
+            self.assertIn("过期", result["error"])
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 0)
+            self.assertEqual(notified_count, 0)
+
     def test_run_blocks_notification_when_store_coverage_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -740,6 +878,20 @@ class ConfigValidationTests(unittest.TestCase):
 
             self.assertFalse(result["ok"])
             self.assertIn("config_missing", {issue["code"] for issue in result["issues"]})
+
+    def test_validate_config_reports_invalid_excel_age_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["source"]["max_excel_age_hours"] = -1
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(config=str(config_path), state_dir=str(root), require_send_ready=False)
+
+            result = notifier.execute_validate_config(args)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("source_max_excel_age_hours_invalid", {issue["code"] for issue in result["issues"]})
 
     def test_install_schedule_dry_run_refuses_incomplete_send_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
