@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -312,6 +314,61 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertEqual(result["status"], "preflight_failed")
             self.assertIn("command", result)
             self.assertIn("robot_code_missing", {issue["code"] for issue in result["issues"]})
+
+
+class RuntimeFileSafetyTests(unittest.TestCase):
+    def test_run_dws_call_uses_unique_argument_files_within_same_millisecond(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dws_call = root / "dws.cmd"
+            dws_call.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+            original_time = notifier.time.time
+            try:
+                notifier.time.time = lambda: 123456.789  # type: ignore[assignment]
+                notifier.run_dws_call(dws_call, ["first"], root)
+                notifier.run_dws_call(dws_call, ["second"], root)
+            finally:
+                notifier.time.time = original_time  # type: ignore[assignment]
+
+            arg_files = sorted((root / "dws-args").glob("args-*.json"))
+            payloads = [json.loads(path.read_text(encoding="utf-8"))["args"][0] for path in arg_files]
+            self.assertEqual(len(arg_files), 2)
+            self.assertEqual(payloads, ["first", "second"])
+
+    def test_send_dingtalk_uses_unique_message_files_within_same_millisecond(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dws_call = root / "dws.cmd"
+            dws_call.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
+            config = notifier.default_config()
+            config["dingtalk"]["dws_call"] = str(dws_call)
+            original_time = notifier.time.time
+            try:
+                notifier.time.time = lambda: 123456.789  # type: ignore[assignment]
+                notifier.send_dingtalk_markdown(config, root, "t1", "first message", dry_run=True)
+                notifier.send_dingtalk_markdown(config, root, "t2", "second message", dry_run=True)
+            finally:
+                notifier.time.time = original_time  # type: ignore[assignment]
+
+            message_files = sorted((root / "messages").glob("message-*.md"))
+            payloads = [path.read_text(encoding="utf-8") for path in message_files]
+            self.assertEqual(len(message_files), 2)
+            self.assertEqual(payloads, ["first message", "second message"])
+
+    def test_self_test_can_run_twice_without_leaving_locked_state(self) -> None:
+        root = notifier.DEFAULT_STATE_DIR / f"self-test-unit-{uuid.uuid4().hex}"
+        args = argparse.Namespace(state_dir=str(root))
+
+        try:
+            first = notifier.execute_self_test(args)
+            second = notifier.execute_self_test(args)
+
+            self.assertTrue(first["ok"])
+            self.assertTrue(second["ok"])
+            self.assertTrue((root / "state.sqlite").is_file())
+        finally:
+            if root.exists():
+                shutil.rmtree(root)
 
 
 class SendFailureTests(unittest.TestCase):

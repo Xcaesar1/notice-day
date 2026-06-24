@@ -677,7 +677,7 @@ def run_dws_call(dws_call: Path, args: list[str], state_dir: Path, timeout: int 
         raise FileNotFoundError(f"DWS 调用入口不存在: {dws_call}")
     args_dir = state_dir / "dws-args"
     args_dir.mkdir(parents=True, exist_ok=True)
-    args_file = args_dir / f"args-{int(time.time() * 1000)}.json"
+    args_file = args_dir / f"args-{run_id_text()}.json"
     with args_file.open("w", encoding="utf-8") as fh:
         json.dump({"args": args}, fh, ensure_ascii=False)
     return subprocess.run(
@@ -709,7 +709,7 @@ def send_dingtalk_markdown(
 
     message_dir = state_dir / "messages"
     message_dir.mkdir(parents=True, exist_ok=True)
-    message_file = message_dir / f"message-{int(time.time() * 1000)}.md"
+    message_file = message_dir / f"message-{run_id_text()}.md"
     message_file.write_text(markdown, encoding="utf-8")
 
     args = [
@@ -1449,9 +1449,12 @@ def execute_self_test(args: argparse.Namespace) -> dict[str, Any]:
     )
     first = execute_run(first_args)
 
-    with connect_db(Path(config["state"]["db_path"])) as conn:
+    conn = connect_db(Path(config["state"]["db_path"]))
+    try:
         sample_items = load_sample_items()
         mark_notified(conn, sample_items, now_text())
+    finally:
+        conn.close()
 
     second = execute_run(first_args)
 
@@ -1474,8 +1477,11 @@ def execute_self_test(args: argparse.Namespace) -> dict[str, Any]:
             source_file="sample-changed",
         )
     ]
-    with connect_db(Path(config["state"]["db_path"])) as conn:
+    conn = connect_db(Path(config["state"]["db_path"]))
+    try:
         changed_candidates = select_notify_candidates(conn, changed_items)
+    finally:
+        conn.close()
 
     return {
         "ok": first["notify_candidates"] == 1 and second["notify_candidates"] == 0 and len(changed_candidates) == 1,
