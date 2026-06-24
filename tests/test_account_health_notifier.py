@@ -711,6 +711,54 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual(attempt_count, 0)
             self.assertEqual(notified_count, 0)
 
+    def test_run_skips_when_another_run_lock_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lock_path = root / "run.lock"
+            lock_path.write_text('{"run_id":"previous"}', encoding="utf-8")
+            dws_call = root / "dws.cmd"
+            dws_call.write_text("@echo off\r\nexit /b 1\r\n", encoding="utf-8")
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["dingtalk"]["dws_call"] = str(dws_call)
+            config["dingtalk"]["send_enabled"] = False
+            config["notify"]["require_all_stores_before_send"] = False
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=True,
+                send=False,
+            )
+
+            result = notifier.execute_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "run_locked")
+            self.assertEqual(result["notify_candidates"], 0)
+            self.assertIn("run.lock", result["error"])
+            self.assertTrue(lock_path.is_file())
+            self.assertFalse((root / "messages").exists())
+            self.assertTrue(Path(result["artifact"]).is_file())
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 0)
+            self.assertEqual(notified_count, 0)
+
     def test_run_blocks_notification_when_store_coverage_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -893,6 +941,20 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("source_max_excel_age_hours_invalid", {issue["code"] for issue in result["issues"]})
 
+    def test_validate_config_reports_invalid_run_lock_ttl(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["state"]["run_lock_ttl_minutes"] = 0
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(config=str(config_path), state_dir=str(root), require_send_ready=False)
+
+            result = notifier.execute_validate_config(args)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("run_lock_ttl_minutes_invalid", {issue["code"] for issue in result["issues"]})
+
     def test_install_schedule_dry_run_refuses_incomplete_send_config(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -959,6 +1021,44 @@ class ConfigValidationTests(unittest.TestCase):
 
 
 class RuntimeFileSafetyTests(unittest.TestCase):
+    def test_run_lock_is_released_when_artifact_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["dingtalk"]["send_enabled"] = False
+            config["notify"]["require_all_stores_before_send"] = False
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=True,
+                send=False,
+            )
+            original_update = notifier.update_run_artifacts
+
+            def raise_artifact_error(*_args, **_kwargs):
+                raise RuntimeError("artifact write failed")
+
+            try:
+                notifier.update_run_artifacts = raise_artifact_error  # type: ignore[assignment]
+                with self.assertRaises(RuntimeError):
+                    notifier.execute_run(args)
+            finally:
+                notifier.update_run_artifacts = original_update  # type: ignore[assignment]
+
+            self.assertFalse((root / "run.lock").exists())
+
     def test_run_dws_call_uses_unique_argument_files_within_same_millisecond(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

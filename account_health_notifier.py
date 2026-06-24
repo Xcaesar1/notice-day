@@ -172,6 +172,12 @@ class SourceStaleError(Exception):
         self.path = path
 
 
+class RunLockError(Exception):
+    def __init__(self, path: Path, message: str):
+        super().__init__(message)
+        self.path = path
+
+
 def clean_text(value: Any) -> str:
     if value is None:
         return ""
@@ -226,6 +232,7 @@ def default_config() -> dict[str, Any]:
         "state": {
             "db_path": str(DEFAULT_DB_PATH),
             "result_dir": str(DEFAULT_STATE_DIR / "runs"),
+            "run_lock_ttl_minutes": 240,
         },
     }
 
@@ -307,6 +314,42 @@ def connect_db(path: Path) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+def configured_run_lock_ttl_minutes(config: dict[str, Any]) -> float:
+    raw = config.get("state", {}).get("run_lock_ttl_minutes", 240)
+    if raw in (None, ""):
+        return 240.0
+    try:
+        value = float(raw)
+    except Exception:
+        raise ValueError("state.run_lock_ttl_minutes 必须是数字")
+    if value <= 0:
+        raise ValueError("state.run_lock_ttl_minutes 必须大于 0")
+    return value
+
+
+def acquire_run_lock(state_dir: Path, run_id: str, ttl_minutes: float) -> Path:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / "run.lock"
+    if lock_path.exists():
+        age_minutes = max(0.0, (time.time() - lock_path.stat().st_mtime) / 60)
+        if age_minutes > ttl_minutes:
+            lock_path.unlink()
+        else:
+            raise RunLockError(lock_path, f"已有运行锁未释放: {lock_path}; 文件年龄 {age_minutes:.1f} 分钟。")
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        raise RunLockError(lock_path, f"已有运行锁未释放: {lock_path}。")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"run_id": run_id, "pid": os.getpid(), "acquired_at": now_text()}, fh, ensure_ascii=False)
+    return lock_path
+
+
+def release_run_lock(lock_path: Path | None) -> None:
+    if lock_path and lock_path.exists():
+        lock_path.unlink()
 
 
 def prune_old_items(conn: sqlite3.Connection, retention_days: int) -> int:
@@ -1022,6 +1065,11 @@ def validate_runtime_config(
     except Exception:
         issues.append(issue("interval_hours_invalid", "interval_hours 必须是正整数"))
 
+    try:
+        configured_run_lock_ttl_minutes(config)
+    except Exception as exc:
+        issues.append(issue("run_lock_ttl_minutes_invalid", str(exc)))
+
     db_path = Path(config.get("state", {}).get("db_path") or state_dir / "state.sqlite")
     result_dir = Path(config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
 
@@ -1323,8 +1371,10 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     status = "success"
     error = ""
     coverage_summary: dict[str, Any] = {}
+    lock_path: Path | None = None
 
     try:
+        lock_path = acquire_run_lock(state_dir, run_id, configured_run_lock_ttl_minutes(config))
         try:
             retention_days = int(config.get("notify", {}).get("dedupe_retention_days") or 90)
             if retention_days <= 0:
@@ -1391,6 +1441,11 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
         error = str(exc)
         source = str(exc.path)
         write_run_start(conn, run_id, started_at, source)
+    except RunLockError as exc:
+        status = "run_locked"
+        error = str(exc)
+        source = str(exc.path)
+        write_run_start(conn, run_id, started_at, source)
     except Exception as exc:
         status = "failed"
         error = str(exc)
@@ -1398,28 +1453,31 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
             source = "unknown"
         write_run_start(conn, run_id, started_at, source)
     finally:
-        total_items = 0
         try:
-            total_items = len(items)  # type: ignore[name-defined]
-        except Exception:
             total_items = 0
-        write_run_end(conn, run_id, total_items, len(candidates), sent_items, status, error)
-        for item in candidates:
-            notify_status = "sent" if sent_items and item in candidates[:sent_items] else status
-            item_rows.append(item.to_row(run_id, notify_status))
-        run_row = {
-            "run_id": run_id,
-            "started_at": started_at,
-            "ended_at": now_text(),
-            "source": source,
-            "total_items": total_items,
-            "notify_candidates": len(candidates),
-            "sent_items": sent_items,
-            "status": status,
-            "error": error,
-        }
-        artifact = update_run_artifacts(config, run_id, item_rows, run_row)
-        conn.close()
+            try:
+                total_items = len(items)  # type: ignore[name-defined]
+            except Exception:
+                total_items = 0
+            write_run_end(conn, run_id, total_items, len(candidates), sent_items, status, error)
+            for item in candidates:
+                notify_status = "sent" if sent_items and item in candidates[:sent_items] else status
+                item_rows.append(item.to_row(run_id, notify_status))
+            run_row = {
+                "run_id": run_id,
+                "started_at": started_at,
+                "ended_at": now_text(),
+                "source": source,
+                "total_items": total_items,
+                "notify_candidates": len(candidates),
+                "sent_items": sent_items,
+                "status": status,
+                "error": error,
+            }
+            artifact = update_run_artifacts(config, run_id, item_rows, run_row)
+        finally:
+            conn.close()
+            release_run_lock(lock_path)
 
     return {
         "ok": status in {"success", "no_new_items", "dry_run"},

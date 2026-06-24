@@ -26,6 +26,7 @@
   },
   "state": {
     "db_path": ".local-state\\account-health-notifier\\state.sqlite",
-    "result_dir": ".local-state\\account-health-notifier\\runs"
+    "result_dir": ".local-state\\account-health-notifier\\runs",
+    "run_lock_ttl_minutes": 240
   }
 }
