@@ -1269,6 +1269,12 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
                 raise ValueError
         except Exception:
             raise ValueError("dedupe_retention_days 必须是正整数")
+        try:
+            max_items = int(config.get("notify", {}).get("max_items_per_message") or 60)
+            if max_items <= 0:
+                raise ValueError
+        except Exception:
+            raise ValueError("max_items_per_message 必须是正整数")
         prune_old_items(conn, retention_days)
         items, source = load_items(config, args)
         write_run_start(conn, run_id, started_at, source)
@@ -1286,7 +1292,6 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
             if not args.send and not config.get("dingtalk", {}).get("send_enabled", False):
                 dry_run = True
 
-            max_items = int(config.get("notify", {}).get("max_items_per_message") or 60)
             chunks = chunked(candidates, max_items)
             title_prefix = clean_text(config.get("dingtalk", {}).get("title_prefix") or "亚马逊账号状况异常")
             for index, chunk in enumerate(chunks, start=1):

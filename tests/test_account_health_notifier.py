@@ -464,6 +464,48 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual(result["notify_candidates"], 0)
             self.assertTrue(Path(result["artifact"]).is_file())
 
+    def test_run_reports_invalid_max_items_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["dingtalk"]["send_enabled"] = False
+            config["notify"]["require_all_stores_before_send"] = False
+            config["notify"]["max_items_per_message"] = "abc"
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=True,
+                send=False,
+            )
+
+            result = notifier.execute_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("max_items_per_message", result["error"])
+            self.assertEqual(result["notify_candidates"], 0)
+            self.assertTrue(Path(result["artifact"]).is_file())
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 0)
+            self.assertEqual(notified_count, 0)
+
 
 class ConfigValidationTests(unittest.TestCase):
     def _base_config_path(self, root: Path) -> Path:
