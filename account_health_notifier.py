@@ -1407,6 +1407,15 @@ def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     config = load_config(config_path)
     state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
     dry_run = not args.send
+    if not dry_run:
+        validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=True)
+        if not validation["ok"]:
+            return {
+                "ok": False,
+                "status": "preflight_failed",
+                "dry_run": False,
+                "issues": validation["issues"],
+            }
     title = f"{config.get('dingtalk', {}).get('title_prefix', '亚马逊账号状况异常')}测试消息"
     markdown = "### 亚马逊账号状况异常测试消息\n\n- 这是一条 DWS 应用机器人连通性测试。\n- 如果你看到这条消息, 说明机器人发群链路可用。\n"
     result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)

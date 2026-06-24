@@ -464,6 +464,23 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertEqual(result["status"], "preflight_failed")
             self.assertIn("interval_hours_invalid", {issue["code"] for issue in result["issues"]})
 
+    def test_send_test_send_requires_send_ready_config_without_calling_dws(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            args = argparse.Namespace(config=str(config_path), state_dir=str(root), send=True)
+
+            result = notifier.execute_send_test(args)
+
+            codes = {issue["code"] for issue in result["issues"]}
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "preflight_failed")
+            self.assertFalse(result["dry_run"])
+            self.assertIn("robot_code_missing", codes)
+            self.assertIn("group_open_conversation_id_missing", codes)
+            self.assertIn("send_enabled_false", codes)
+            self.assertFalse((root / "messages").exists())
+
 
 class RuntimeFileSafetyTests(unittest.TestCase):
     def test_run_dws_call_uses_unique_argument_files_within_same_millisecond(self) -> None:
