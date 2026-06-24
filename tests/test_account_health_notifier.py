@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -190,6 +191,20 @@ class ExcelEndToEndTests(unittest.TestCase):
             self.assertEqual(len(detail_rows), 2)
             self.assertIn("Hangoro", {row["名称"] for row in summary_rows if row["维度"] == "覆盖缺失店铺"})
 
+    def test_find_latest_excel_ignores_generated_notifier_reports(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "sellercentral-account-health.xlsx"
+            generated = root / "account-health-parse-20260625_120000_000000_deadbeef.xlsx"
+            write_single_sheet_xlsx(source, "异常明细", ["店铺", "站点", "异常分类"], [])
+            write_single_sheet_xlsx(generated, "全店铺明细", ["店铺", "站点", "异常分类"], [])
+            os.utime(source, (1000, 1000))
+            os.utime(generated, (2000, 2000))
+
+            selected = notifier.find_latest_excel(root)
+
+            self.assertEqual(selected, source)
+
 
 class RunIdTests(unittest.TestCase):
     def test_run_id_has_microsecond_precision(self) -> None:
@@ -314,6 +329,31 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertEqual(result["status"], "preflight_failed")
             self.assertIn("command", result)
             self.assertIn("robot_code_missing", {issue["code"] for issue in result["issues"]})
+
+    def test_install_schedule_reports_invalid_interval_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["dingtalk"]["robot_code"] = "robot"
+            config["dingtalk"]["group_open_conversation_id"] = "group"
+            config["dingtalk"]["send_enabled"] = True
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                dry_run=True,
+                task_name="",
+                interval_hours="abc",
+                python="",
+                skip_preflight=False,
+            )
+
+            result = notifier.execute_install_schedule(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "preflight_failed")
+            self.assertIn("interval_hours_invalid", {issue["code"] for issue in result["issues"]})
 
 
 class RuntimeFileSafetyTests(unittest.TestCase):

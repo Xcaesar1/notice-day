@@ -414,10 +414,12 @@ def find_latest_excel(directory: Path) -> Path:
     candidates = [
         path
         for path in directory.glob("*.xlsx")
-        if not path.name.startswith("~$") and path.is_file()
+        if not path.name.startswith("~$")
+        and not path.name.startswith("account-health-")
+        and path.is_file()
     ]
     if not candidates:
-        raise FileNotFoundError(f"结果目录中没有 xlsx 文件: {directory}")
+        raise FileNotFoundError(f"结果目录中没有可作为源数据的 xlsx 文件: {directory}")
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
@@ -1381,7 +1383,18 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
     schedule = config.get("schedule", {})
     task_name = args.task_name or schedule.get("task_name") or DEFAULT_TASK_NAME
-    interval = int(args.interval_hours or schedule.get("interval_hours") or 6)
+    interval_raw = args.interval_hours or schedule.get("interval_hours") or 6
+    try:
+        interval = int(interval_raw)
+        if interval <= 0:
+            raise ValueError
+    except Exception:
+        return {
+            "ok": False,
+            "status": "preflight_failed",
+            "dry_run": bool(args.dry_run),
+            "issues": [issue("interval_hours_invalid", "interval_hours 必须是正整数")],
+        }
     python_exe = Path(args.python or sys.executable).resolve()
     script = Path(__file__).resolve()
     command = f'"{python_exe}" "{script}" run --config "{config_path}"'
