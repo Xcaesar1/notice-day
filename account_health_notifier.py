@@ -1162,7 +1162,13 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
             for index, chunk in enumerate(chunks, start=1):
                 title = f"{title_prefix}新增通知 {run_id}"
                 markdown = render_markdown(chunk, title, index, len(chunks))
-                result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
+                try:
+                    result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
+                except Exception as exc:
+                    status = "send_failed"
+                    error = str(exc)
+                    record_attempt(conn, run_id, dry_run, "failed", len(chunk), title, error=error)
+                    break
                 if result.returncode == 0:
                     record_attempt(conn, run_id, dry_run, "dry_run" if dry_run else "sent", len(chunk), title, dws_stdout=result.stdout, dws_stderr=result.stderr)
                     if not dry_run:
@@ -1170,14 +1176,15 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
                         sent_items += len(chunk)
                 else:
                     status = "send_failed"
-                    record_attempt(conn, run_id, dry_run, "failed", len(chunk), title, error=f"exit={result.returncode}", dws_stdout=result.stdout, dws_stderr=result.stderr)
-                    if not dry_run:
-                        break
+                    error = f"exit={result.returncode}"
+                    record_attempt(conn, run_id, dry_run, "failed", len(chunk), title, error=error, dws_stdout=result.stdout, dws_stderr=result.stderr)
+                    break
 
-            if not candidates:
-                status = "no_new_items"
-            elif dry_run:
-                status = "dry_run"
+            if status != "send_failed":
+                if not candidates:
+                    status = "no_new_items"
+                elif dry_run:
+                    status = "dry_run"
     except Exception as exc:
         status = "failed"
         error = str(exc)

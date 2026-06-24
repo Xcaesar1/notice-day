@@ -71,3 +71,4 @@ python account_health_notifier.py install-schedule --json
 - 缺少 `robot_code` 或 `group_open_conversation_id` 时不能真实发送。
 - `send_enabled=false` 时, `run` 默认 dry-run; 需要真实发送时使用 `--send` 或将配置改为 `true`。
 - 单次发送失败不会标记为已通知, 下一轮会重试。
+- DWS 返回非 0 或入口缺失会记录为 `send_failed`, 不会被误判为 dry-run 成功。

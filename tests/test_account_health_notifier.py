@@ -6,12 +6,34 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import account_health_notifier as notifier  # noqa: E402
+
+
+def write_single_sheet_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f'<sheets><sheet name="{sheet_name}" sheetId="1" r:id="rId1"/></sheets>'
+            "</workbook>",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr("xl/worksheets/sheet1.xml", notifier._worksheet_xml(headers, rows))
 
 
 class ProductExtractionTests(unittest.TestCase):
@@ -74,6 +96,99 @@ class CoverageSummaryTests(unittest.TestCase):
         self.assertEqual(summary["missing_asin"], 0)
 
 
+class ExcelEndToEndTests(unittest.TestCase):
+    def test_parse_generated_excel_filters_site_dedupes_and_writes_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_excel = root / "source.xlsx"
+            store_list = root / "stores.xlsx"
+            output_dir = root / "out"
+            rows = [
+                {
+                    "店铺": "BYF",
+                    "站点": notifier.SITE_US,
+                    "异常分类": "食品和商品安全问题",
+                    "ASIN": "",
+                    "SKU": "",
+                    "原因": "安全饮用水法案",
+                    "日期": "2026-01-30",
+                    "哪些商品会受到影响？": "Product A ASIN: B0FPKWYF49 SKU: BF-9901-BN Product B ASIN: B0G7VV33CTSKU: HG-8901ORB2",
+                    "存在销售风险": "过去 12 个月无销量",
+                    "采取的操作": "商品已移除",
+                    "账户状况评级影响": "无影响",
+                },
+                {
+                    "店铺": "BYF",
+                    "站点": notifier.SITE_US,
+                    "异常分类": "食品和商品安全问题",
+                    "ASIN": "",
+                    "SKU": "",
+                    "原因": "安全饮用水法案",
+                    "日期": "2026-01-30",
+                    "哪些商品会受到影响？": "Product A ASIN: B0FPKWYF49 SKU: BF-9901-BN Product B ASIN: B0G7VV33CTSKU: HG-8901ORB2",
+                    "存在销售风险": "过去 12 个月无销量",
+                    "采取的操作": "商品已移除",
+                    "账户状况评级影响": "无影响",
+                },
+                {
+                    "店铺": "BYF",
+                    "站点": "加拿大",
+                    "异常分类": "食品和商品安全问题",
+                    "原因": "不应纳入美国站",
+                    "日期": "2026-01-30",
+                    "哪些商品会受到影响？": "ASIN: B0F6NCL5SH SKU: CA-SKU",
+                },
+            ]
+            detail_headers = [
+                "店铺",
+                "站点",
+                "异常分类",
+                "原因",
+                "日期",
+                "哪些商品会受到影响？",
+                "存在销售风险",
+                "采取的操作",
+                "账户状况评级影响",
+            ]
+            write_single_sheet_xlsx(source_excel, "异常明细", detail_headers, rows)
+            write_single_sheet_xlsx(
+                store_list,
+                "店铺执行清单",
+                ["店铺", "站点"],
+                [
+                    {"店铺": "BYF", "站点": notifier.SITE_US},
+                    {"店铺": "Hangoro", "站点": notifier.SITE_US},
+                    {"店铺": "CanadaShop", "站点": "加拿大"},
+                ],
+            )
+            args = argparse.Namespace(
+                config=str(root / "missing-config.json"),
+                state_dir=str(root),
+                source_type="excel",
+                source_excel=str(source_excel),
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list=str(store_list),
+                output_dir=str(output_dir),
+                require_all_stores=True,
+            )
+
+            result = notifier.execute_parse(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["total_items"], 2)
+            self.assertEqual(result["missing_stores"], ["Hangoro"])
+            self.assertEqual(result["missing_asin"], 0)
+            self.assertEqual(result["missing_sku"], 0)
+            artifact = Path(result["artifact"])
+            self.assertTrue(artifact.is_file())
+            workbook = notifier.read_xlsx_workbook(artifact)
+            detail_rows = notifier.rows_to_dicts(workbook["全店铺明细"])
+            summary_rows = notifier.rows_to_dicts(workbook["解析汇总"])
+            self.assertEqual(len(detail_rows), 2)
+            self.assertIn("Hangoro", {row["名称"] for row in summary_rows if row["维度"] == "覆盖缺失店铺"})
+
+
 class RunIdTests(unittest.TestCase):
     def test_run_id_has_microsecond_precision(self) -> None:
         first = notifier.run_id_text()
@@ -126,6 +241,128 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual(result["status"], "coverage_failed")
             self.assertEqual(result["notify_candidates"], 0)
             self.assertIn("Hangoro", result["error"])
+
+
+class SendFailureTests(unittest.TestCase):
+    def _write_config(self, root: Path, dws_call: Path) -> Path:
+        config = notifier.default_config()
+        config["source"]["type"] = "sample"
+        config["dingtalk"]["dws_call"] = str(dws_call)
+        config["dingtalk"]["robot_code"] = "robot"
+        config["dingtalk"]["group_open_conversation_id"] = "group"
+        config["dingtalk"]["send_enabled"] = True
+        config["notify"]["require_all_stores_before_send"] = False
+        config["state"]["db_path"] = str(root / "state.sqlite")
+        config["state"]["result_dir"] = str(root / "runs")
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        return config_path
+
+    def _run_args(self, root: Path, config_path: Path, *, dry_run: bool, send: bool) -> argparse.Namespace:
+        return argparse.Namespace(
+            config=str(config_path),
+            state_dir=str(root),
+            source_type="",
+            source_excel="",
+            source_dir="",
+            site=notifier.SITE_US,
+            store_list="",
+            require_all_stores=False,
+            skip_store_coverage=True,
+            dry_run=dry_run,
+            send=send,
+        )
+
+    def test_dry_run_dws_failure_is_not_reported_as_success(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dws_call = root / "fail-dws.cmd"
+            dws_call.write_text("@echo off\r\necho failed 1>&2\r\nexit /b 9\r\n", encoding="utf-8")
+            config_path = self._write_config(root, dws_call)
+
+            result = notifier.execute_run(self._run_args(root, config_path, dry_run=True, send=False))
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "send_failed")
+            self.assertEqual(result["notify_candidates"], 1)
+            self.assertEqual(result["sent_items"], 0)
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts WHERE status = 'failed'").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 1)
+            self.assertEqual(notified_count, 0)
+
+    def test_missing_dws_is_recorded_as_send_failure_without_marking_notified(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._write_config(root, root / "missing-dws.cmd")
+
+            result = notifier.execute_run(self._run_args(root, config_path, dry_run=False, send=True))
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "send_failed")
+            self.assertIn("DWS", result["error"])
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts WHERE status = 'failed'").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 1)
+            self.assertEqual(notified_count, 0)
+
+
+class SendSuccessTests(unittest.TestCase):
+    def test_successful_fake_send_marks_notified_and_second_run_has_no_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            dws_call = root / "success-dws.cmd"
+            dws_call.write_text("@echo off\r\necho {\"ok\":true}\r\nexit /b 0\r\n", encoding="utf-8")
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["dingtalk"]["dws_call"] = str(dws_call)
+            config["dingtalk"]["robot_code"] = "robot"
+            config["dingtalk"]["group_open_conversation_id"] = "group"
+            config["dingtalk"]["send_enabled"] = True
+            config["notify"]["require_all_stores_before_send"] = False
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=False,
+                send=True,
+            )
+
+            first = notifier.execute_run(args)
+            second = notifier.execute_run(args)
+
+            self.assertTrue(first["ok"])
+            self.assertEqual(first["status"], "success")
+            self.assertEqual(first["sent_items"], 1)
+            self.assertTrue(second["ok"])
+            self.assertEqual(second["status"], "no_new_items")
+            self.assertEqual(second["notify_candidates"], 0)
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+                sent_attempts = conn.execute("SELECT COUNT(*) FROM notification_attempts WHERE status = 'sent'").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(notified_count, 1)
+            self.assertEqual(sent_attempts, 1)
 
 
 if __name__ == "__main__":
