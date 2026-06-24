@@ -1,0 +1,28 @@
+{
+  "source": {
+    "type": "excel_latest",
+    "excel_path": "",
+    "excel_dir": "C:\\Users\\god\\Desktop\\RPA下载结果\\账户状况异常明细",
+    "store_list_path": "F:\\店铺清单.xlsx",
+    "site": "美国"
+  },
+  "dingtalk": {
+    "dws_call": "Q:\\Dingcli\\dws-call.cmd",
+    "robot_code": "",
+    "group_open_conversation_id": "",
+    "title_prefix": "亚马逊账号状况异常",
+    "send_enabled": false
+  },
+  "notify": {
+    "dedupe_retention_days": 90,
+    "max_items_per_message": 60
+  },
+  "schedule": {
+    "task_name": "YD-AmazonAccountHealth-DingTalkNotifier",
+    "interval_hours": 6
+  },
+  "state": {
+    "db_path": ".local-state\\account-health-notifier\\state.sqlite",
+    "result_dir": ".local-state\\account-health-notifier\\runs"
+  }
+}

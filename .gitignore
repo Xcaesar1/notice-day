@@ -1,0 +1,23 @@
+# Runtime state and local configs
+.local-state/
+config.local.json
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Local databases and run artifacts
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+~$*.xlsx
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
