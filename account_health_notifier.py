@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,6 +72,12 @@ RUN_HEADERS = [
     "sent_items",
     "status",
     "error",
+]
+
+PARSE_SUMMARY_HEADERS = [
+    "维度",
+    "名称",
+    "数量",
 ]
 
 HEADER_ALIASES = {
@@ -179,6 +186,10 @@ def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def run_id_text() -> str:
+    return f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:8]}"
+
+
 def default_config() -> dict[str, Any]:
     return {
         "source": {
@@ -198,6 +209,7 @@ def default_config() -> dict[str, Any]:
         "notify": {
             "dedupe_retention_days": 90,
             "max_items_per_message": 60,
+            "require_all_stores_before_send": True,
         },
         "schedule": {
             "task_name": DEFAULT_TASK_NAME,
@@ -409,18 +421,51 @@ def find_latest_excel(directory: Path) -> Path:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
+def load_expected_stores(path: Path, target_site: str = SITE_US) -> list[str]:
+    if not path.is_file():
+        return []
+    workbook = read_xlsx_workbook(path)
+    selected_rows: list[list[str]] | None = None
+    for name, rows in workbook.items():
+        if clean_text(name) == "店铺执行清单":
+            selected_rows = rows
+            break
+    if selected_rows is None:
+        selected_rows = next(iter(workbook.values()), [])
+    stores: list[str] = []
+    seen: set[str] = set()
+    for row in rows_to_dicts(selected_rows):
+        store = clean_text(row.get("店铺"))
+        site = clean_text(row.get("站点"))
+        if not store or site != target_site:
+            continue
+        key = normalize_for_key(store)
+        if key in seen:
+            continue
+        seen.add(key)
+        stores.append(store)
+    return stores
+
+
 def extract_products(text: str) -> list[dict[str, str]]:
     body = clean_text(text)
-    asin_matches = list(re.finditer(r"\bASIN\s*[:：]?\s*([A-Z0-9]{10})\b", body, re.IGNORECASE))
+    body = re.sub(r"([A-Z0-9]{10})(SKU\s*[:：])", r"\1 \2", body, flags=re.IGNORECASE)
+    asin_matches = list(
+        re.finditer(
+            r"ASIN[^A-Z0-9]{0,8}([A-Z0-9]{10})(?=\s*SKU\b|\s|$|[,，;；|])",
+            body,
+            re.IGNORECASE,
+        )
+    )
     if not asin_matches:
-        sku_match = re.search(r"\bSKU\s*[:：]?\s*([^\s,，;；|]+)", body, re.IGNORECASE)
+        sku_match = re.search(r"SKU[^A-Z0-9]{0,8}([A-Z0-9][A-Z0-9._/-]{0,80})", body, re.IGNORECASE)
         return [{"asin": "", "sku": sku_match.group(1).strip() if sku_match else ""}]
 
     products: list[dict[str, str]] = []
     for index, match in enumerate(asin_matches):
         segment_end = asin_matches[index + 1].start() if index + 1 < len(asin_matches) else len(body)
         segment = body[match.start() : segment_end]
-        sku_match = re.search(r"\bSKU\s*[:：]?\s*([^\s,，;；|]+)", segment, re.IGNORECASE)
+        sku_match = re.search(r"SKU[^A-Z0-9]{0,8}([A-Z0-9][A-Z0-9._/-]{0,80})", segment, re.IGNORECASE)
         products.append(
             {
                 "asin": match.group(1).upper(),
@@ -436,6 +481,8 @@ def item_from_detail_row(row: dict[str, str], source_file: str) -> list[ImpactIt
     products = extract_products(impacted_text)
     items = []
     for product in products:
+        if not clean_text(product.get("asin")) and not clean_text(product.get("sku")):
+            continue
         items.append(
             ImpactItem(
                 store=clean_text(row.get("店铺")),
@@ -865,6 +912,214 @@ def update_run_artifacts(
     return result_path
 
 
+def summarize_items(items: list[ImpactItem], expected_stores: list[str] | None = None) -> dict[str, Any]:
+    by_store: dict[str, int] = {}
+    by_category: dict[str, int] = {}
+    by_store_category: dict[str, dict[str, int]] = {}
+    missing_asin = 0
+    missing_sku = 0
+    for item in items:
+        store = item.store or "未识别店铺"
+        category = item.category or "未识别分类"
+        by_store[store] = by_store.get(store, 0) + 1
+        by_category[category] = by_category.get(category, 0) + 1
+        by_store_category.setdefault(store, {})
+        by_store_category[store][category] = by_store_category[store].get(category, 0) + 1
+        if not item.asin:
+            missing_asin += 1
+        if not item.sku:
+            missing_sku += 1
+    expected_stores = expected_stores or []
+    parsed_store_keys = {normalize_for_key(store) for store in by_store}
+    missing_stores = [
+        store for store in expected_stores if normalize_for_key(store) not in parsed_store_keys
+    ]
+    extra_stores = [
+        store
+        for store in by_store
+        if normalize_for_key(store) not in {normalize_for_key(item) for item in expected_stores}
+    ] if expected_stores else []
+    coverage_ok = not expected_stores or not missing_stores
+    return {
+        "total_items": len(items),
+        "store_count": len(by_store),
+        "expected_store_count": len(expected_stores),
+        "coverage_ok": coverage_ok,
+        "missing_stores": missing_stores,
+        "extra_stores": extra_stores,
+        "category_count": len(by_category),
+        "missing_asin": missing_asin,
+        "missing_sku": missing_sku,
+        "by_store": dict(sorted(by_store.items())),
+        "by_category": dict(sorted(by_category.items())),
+        "by_store_category": {
+            store: dict(sorted(categories.items()))
+            for store, categories in sorted(by_store_category.items())
+        },
+    }
+
+
+def build_coverage_summary(config: dict[str, Any], args: argparse.Namespace, items: list[ImpactItem]) -> dict[str, Any]:
+    source_config = config.get("source", {})
+    store_list_path = Path(getattr(args, "store_list", "") or source_config.get("store_list_path") or "")
+    target_site = getattr(args, "site", "") or source_config.get("site") or SITE_US
+    expected_stores = load_expected_stores(store_list_path, target_site)
+    summary = summarize_items(items, expected_stores=expected_stores)
+    summary["store_list_path"] = str(store_list_path)
+    summary["target_site"] = target_site
+    return summary
+
+
+def selected_source_type(config: dict[str, Any], args: argparse.Namespace) -> str:
+    source_config = config.get("source", {})
+    if getattr(args, "source_excel", ""):
+        return "excel"
+    return getattr(args, "source_type", "") or source_config.get("type") or "excel_latest"
+
+
+def should_require_store_coverage(config: dict[str, Any], args: argparse.Namespace) -> bool:
+    if getattr(args, "skip_store_coverage", False):
+        return False
+    if getattr(args, "require_all_stores", False):
+        return True
+    if selected_source_type(config, args) == "sample":
+        return False
+    return bool(config.get("notify", {}).get("require_all_stores_before_send", False))
+
+
+def coverage_failure_message(summary: dict[str, Any]) -> str:
+    expected_count = int(summary.get("expected_store_count") or 0)
+    if expected_count <= 0:
+        return f"店铺清单为空或无法读取, 无法确认全店铺覆盖: {summary.get('store_list_path', '')}"
+    missing_stores = summary.get("missing_stores", [])
+    if missing_stores:
+        shown = ", ".join(missing_stores[:20])
+        suffix = "" if len(missing_stores) <= 20 else f" 等 {len(missing_stores)} 个"
+        return f"店铺覆盖不完整, 缺失 {len(missing_stores)} 个美国站店铺: {shown}{suffix}"
+    return ""
+
+
+def summary_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for store, count in summary.get("by_store", {}).items():
+        rows.append({"维度": "店铺", "名称": store, "数量": count})
+    for category, count in summary.get("by_category", {}).items():
+        rows.append({"维度": "异常分类", "名称": category, "数量": count})
+    for store, categories in summary.get("by_store_category", {}).items():
+        for category, count in categories.items():
+            rows.append({"维度": f"店铺/异常分类:{store}", "名称": category, "数量": count})
+    for store in summary.get("missing_stores", []):
+        rows.append({"维度": "覆盖缺失店铺", "名称": store, "数量": 0})
+    for store in summary.get("extra_stores", []):
+        rows.append({"维度": "清单外店铺", "名称": store, "数量": summary.get("by_store", {}).get(store, 0)})
+    rows.append({"维度": "质量", "名称": "缺少ASIN", "数量": summary.get("missing_asin", 0)})
+    rows.append({"维度": "质量", "名称": "缺少SKU", "数量": summary.get("missing_sku", 0)})
+    return rows
+
+
+def write_parse_xlsx(path: Path, item_rows: list[dict[str, Any]], summary: dict[str, Any]) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+            '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+            '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "docProps/core.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:dcterms="http://purl.org/dc/terms/" '
+            'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
+            'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+            "<dc:creator>YD-MCP</dc:creator>"
+            f'<dcterms:created xsi:type="dcterms:W3CDTF">{created}</dcterms:created>'
+            f'<dcterms:modified xsi:type="dcterms:W3CDTF">{created}</dcterms:modified>'
+            "</cp:coreProperties>",
+        )
+        archive.writestr(
+            "docProps/app.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+            'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+            "<Application>YD-MCP</Application></Properties>",
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<sheets><sheet name="全店铺明细" sheetId="1" r:id="rId1"/>'
+            '<sheet name="解析汇总" sheetId="2" r:id="rId2"/></sheets>'
+            "</workbook>",
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'
+            '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/styles.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+            '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+            '<borders count="1"><border/></borders>'
+            '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+            '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
+            "</styleSheet>",
+        )
+        archive.writestr("xl/worksheets/sheet1.xml", _worksheet_xml(ITEM_HEADERS, item_rows))
+        archive.writestr("xl/worksheets/sheet2.xml", _worksheet_xml(PARSE_SUMMARY_HEADERS, summary_rows(summary)))
+    return str(path)
+
+
+def execute_parse(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    run_id = run_id_text()
+    items, source = load_items(config, args)
+    item_rows = [item.to_row(run_id, "parsed") for item in items]
+    summary = build_coverage_summary(config, args, items)
+    result_dir = Path(args.output_dir or config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
+    artifact = result_dir / f"account-health-parse-{run_id}.xlsx"
+    write_parse_xlsx(artifact, item_rows, summary)
+    coverage_error = coverage_failure_message(summary) if args.require_all_stores else ""
+    ok = not coverage_error
+    return {
+        "ok": ok,
+        "run_id": run_id,
+        "source": source,
+        "artifact": str(artifact),
+        "coverage_error": coverage_error,
+        **summary,
+    }
+
+
 def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path)
@@ -874,7 +1129,7 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     retention_days = int(config.get("notify", {}).get("dedupe_retention_days") or 90)
     prune_old_items(conn, retention_days)
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = run_id_text()
     started_at = now_text()
     source = ""
     item_rows: list[dict[str, Any]] = []
@@ -882,39 +1137,47 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     candidates: list[ImpactItem] = []
     status = "success"
     error = ""
+    coverage_summary: dict[str, Any] = {}
 
     try:
         items, source = load_items(config, args)
         write_run_start(conn, run_id, started_at, source)
-        candidates = select_notify_candidates(conn, items)
-        dry_run = bool(args.dry_run)
-        if args.send:
-            dry_run = False
-        if not args.send and not config.get("dingtalk", {}).get("send_enabled", False):
-            dry_run = True
+        coverage_summary = build_coverage_summary(config, args, items)
+        coverage_error = coverage_failure_message(coverage_summary) if should_require_store_coverage(config, args) else ""
+        if coverage_error:
+            status = "coverage_failed"
+            error = coverage_error
+            candidates = []
+        else:
+            candidates = select_notify_candidates(conn, items)
+            dry_run = bool(args.dry_run)
+            if args.send:
+                dry_run = False
+            if not args.send and not config.get("dingtalk", {}).get("send_enabled", False):
+                dry_run = True
 
-        max_items = int(config.get("notify", {}).get("max_items_per_message") or 60)
-        chunks = chunked(candidates, max_items)
-        title_prefix = clean_text(config.get("dingtalk", {}).get("title_prefix") or "亚马逊账号状况异常")
-        for index, chunk in enumerate(chunks, start=1):
-            title = f"{title_prefix}新增通知 {run_id}"
-            markdown = render_markdown(chunk, title, index, len(chunks))
-            result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
-            if result.returncode == 0:
-                record_attempt(conn, run_id, dry_run, "dry_run" if dry_run else "sent", len(chunk), title, dws_stdout=result.stdout, dws_stderr=result.stderr)
-                if not dry_run:
-                    mark_notified(conn, chunk, now_text())
-                    sent_items += len(chunk)
-            else:
-                status = "send_failed"
-                record_attempt(conn, run_id, dry_run, "failed", len(chunk), title, error=f"exit={result.returncode}", dws_stdout=result.stdout, dws_stderr=result.stderr)
-                if not dry_run:
-                    break
+            max_items = int(config.get("notify", {}).get("max_items_per_message") or 60)
+            chunks = chunked(candidates, max_items)
+            title_prefix = clean_text(config.get("dingtalk", {}).get("title_prefix") or "亚马逊账号状况异常")
+            for index, chunk in enumerate(chunks, start=1):
+                title = f"{title_prefix}新增通知 {run_id}"
+                markdown = render_markdown(chunk, title, index, len(chunks))
+                result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
+                if result.returncode == 0:
+                    record_attempt(conn, run_id, dry_run, "dry_run" if dry_run else "sent", len(chunk), title, dws_stdout=result.stdout, dws_stderr=result.stderr)
+                    if not dry_run:
+                        mark_notified(conn, chunk, now_text())
+                        sent_items += len(chunk)
+                else:
+                    status = "send_failed"
+                    record_attempt(conn, run_id, dry_run, "failed", len(chunk), title, error=f"exit={result.returncode}", dws_stdout=result.stdout, dws_stderr=result.stderr)
+                    if not dry_run:
+                        break
 
-        if not candidates:
-            status = "no_new_items"
-        elif dry_run:
-            status = "dry_run"
+            if not candidates:
+                status = "no_new_items"
+            elif dry_run:
+                status = "dry_run"
     except Exception as exc:
         status = "failed"
         error = str(exc)
@@ -955,6 +1218,7 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
         "sent_items": sent_items,
         "artifact": str(artifact),
         "error": error,
+        "coverage": coverage_summary,
     }
 
 
@@ -1142,9 +1406,23 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--source-excel", default="", help="指定账号状况结果 Excel")
     run.add_argument("--source-dir", default="", help="指定结果 Excel 目录")
     run.add_argument("--site", default="", help="目标站点")
+    run.add_argument("--store-list", default="", help="用于校验店铺覆盖率的店铺清单")
+    run.add_argument("--require-all-stores", action="store_true", help="强制要求店铺清单全部覆盖")
+    run.add_argument("--skip-store-coverage", action="store_true", help="跳过店铺覆盖校验, 仅用于 sample 或排障")
     run.add_argument("--dry-run", action="store_true", help="不真实发送钉钉消息")
     run.add_argument("--send", action="store_true", help="允许真实发送钉钉消息")
     run.set_defaults(func=execute_run)
+
+    parse = sub.add_parser("parse", help="只解析 Excel 并生成全店铺汇总报告, 不发送钉钉")
+    add_common(parse)
+    parse.add_argument("--source-type", choices=["excel", "excel_latest", "sample", "bridge"], default="")
+    parse.add_argument("--source-excel", default="", help="指定账号状况结果 Excel")
+    parse.add_argument("--source-dir", default="", help="指定结果 Excel 目录")
+    parse.add_argument("--site", default="", help="目标站点")
+    parse.add_argument("--store-list", default="", help="用于校验店铺覆盖率的店铺清单")
+    parse.add_argument("--output-dir", default="", help="解析报告输出目录")
+    parse.add_argument("--require-all-stores", action="store_true", help="店铺覆盖不完整时返回失败")
+    parse.set_defaults(func=execute_parse)
 
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)

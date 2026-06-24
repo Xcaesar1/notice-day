@@ -15,7 +15,8 @@
   },
   "notify": {
     "dedupe_retention_days": 90,
-    "max_items_per_message": 60
+    "max_items_per_message": 60,
+    "require_all_stores_before_send": true
   },
   "schedule": {
     "task_name": "YD-AmazonAccountHealth-DingTalkNotifier",

@@ -43,6 +43,14 @@ python account_health_notifier.py self-test --json
 # 从最新 Excel dry-run, 不真实发钉钉
 python account_health_notifier.py run --dry-run --json
 
+# sample 自测不代表全店铺覆盖, 需要显式跳过覆盖校验
+python account_health_notifier.py run --source-type sample --dry-run --skip-store-coverage --json
+
+# 全店铺解析, 只生成报告, 不触发钉钉和去重状态
+python account_health_notifier.py parse --json
+python account_health_notifier.py parse --source-dir "C:\Users\god\Desktop\RPA下载结果\账户状况异常明细" --json
+python account_health_notifier.py parse --source-dir "C:\Users\god\Desktop\RPA下载结果\账户状况异常明细" --require-all-stores --json
+
 # 指定 Excel dry-run
 python account_health_notifier.py run --source-excel "C:\path\账户状况监控_20260624_120000.xlsx" --dry-run --json
 
@@ -53,6 +61,9 @@ python account_health_notifier.py send-test --send --json
 python account_health_notifier.py install-schedule --dry-run --json
 python account_health_notifier.py install-schedule --json
 ```
+
+启用真实定时通知前, 建议先运行 `parse --require-all-stores`: 只有 `coverage_ok=true` 时才代表本次结果覆盖店铺清单里的全部美国站店铺。
+正式 `run` 默认启用 `require_all_stores_before_send`; 如果店铺清单无法读取或美国站店铺缺失, 会返回 `coverage_failed` 并且不会进入钉钉发送。
 
 ## 安全边界
 
