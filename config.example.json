@@ -16,6 +16,7 @@
   "notify": {
     "dedupe_retention_days": 90,
     "max_items_per_message": 60,
+    "require_complete_product_ids_before_send": true,
     "require_all_stores_before_send": true
   },
   "schedule": {

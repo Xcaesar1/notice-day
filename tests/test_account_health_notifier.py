@@ -481,6 +481,98 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual([row["dry_run"] for row in attempts], [1, 1, 1])
             self.assertEqual(notified_count, 0)
 
+    def test_run_blocks_notification_when_product_ids_are_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_excel = root / "source.xlsx"
+            store_list = root / "stores.xlsx"
+            dws_call = root / "dws.cmd"
+            stores = [
+                "BYF",
+                "Hangoro",
+                "Naukwan",
+                "Winkear",
+                "Wowkk",
+                "Lexdale",
+                "Kruzoo",
+                "Taucet",
+                "Soebiz",
+                "Wintap",
+                "Jabbol",
+                "Hanallx",
+                "Qinkell",
+                "Artiqua",
+            ]
+            detail_rows = []
+            for index, store in enumerate(stores):
+                impacted = f"ASIN: B0MISS{index:04d}"
+                if index != 0:
+                    impacted += f" SKU: SKU-{index:04d}"
+                detail_rows.append(
+                    {
+                        "店铺": store,
+                        "站点": notifier.SITE_US,
+                        "异常分类": "食品和商品安全问题",
+                        "原因": "安全饮用水法案",
+                        "日期": "2026-01-30",
+                        "哪些商品会受到影响？": impacted,
+                    }
+                )
+            write_single_sheet_xlsx(
+                source_excel,
+                "异常明细",
+                ["店铺", "站点", "异常分类", "原因", "日期", "哪些商品会受到影响？"],
+                detail_rows,
+            )
+            write_single_sheet_xlsx(
+                store_list,
+                "店铺执行清单",
+                ["店铺", "站点"],
+                [{"店铺": store, "站点": notifier.SITE_US} for store in stores],
+            )
+            dws_call.write_text("@echo off\r\necho {\"ok\":true}\r\nexit /b 0\r\n", encoding="utf-8")
+            config = notifier.default_config()
+            config["source"]["type"] = "excel"
+            config["source"]["excel_path"] = str(source_excel)
+            config["source"]["store_list_path"] = str(store_list)
+            config["dingtalk"]["dws_call"] = str(dws_call)
+            config["dingtalk"]["send_enabled"] = False
+            config["notify"]["require_all_stores_before_send"] = True
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=False,
+                dry_run=True,
+                send=False,
+            )
+
+            result = notifier.execute_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "quality_failed")
+            self.assertEqual(result["notify_candidates"], 0)
+            self.assertTrue(result["coverage"]["coverage_ok"])
+            self.assertEqual(result["coverage"]["missing_sku"], 1)
+            self.assertIn("SKU", result["error"])
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 0)
+            self.assertEqual(notified_count, 0)
+
     def test_run_blocks_notification_when_store_coverage_is_incomplete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

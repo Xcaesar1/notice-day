@@ -209,6 +209,7 @@ def default_config() -> dict[str, Any]:
         "notify": {
             "dedupe_retention_days": 90,
             "max_items_per_message": 60,
+            "require_complete_product_ids_before_send": True,
             "require_all_stores_before_send": True,
         },
         "schedule": {
@@ -1092,6 +1093,10 @@ def should_require_store_coverage(config: dict[str, Any], args: argparse.Namespa
     return bool(config.get("notify", {}).get("require_all_stores_before_send", False))
 
 
+def should_require_complete_product_ids(config: dict[str, Any]) -> bool:
+    return bool(config.get("notify", {}).get("require_complete_product_ids_before_send", True))
+
+
 def coverage_failure_message(summary: dict[str, Any]) -> str:
     expected_count = int(summary.get("expected_store_count") or 0)
     if expected_count <= 0:
@@ -1102,6 +1107,19 @@ def coverage_failure_message(summary: dict[str, Any]) -> str:
         suffix = "" if len(missing_stores) <= 20 else f" 等 {len(missing_stores)} 个"
         return f"店铺覆盖不完整, 缺失 {len(missing_stores)} 个美国站店铺: {shown}{suffix}"
     return ""
+
+
+def product_quality_failure_message(summary: dict[str, Any]) -> str:
+    missing_asin = int(summary.get("missing_asin") or 0)
+    missing_sku = int(summary.get("missing_sku") or 0)
+    if missing_asin <= 0 and missing_sku <= 0:
+        return ""
+    missing_parts = []
+    if missing_asin:
+        missing_parts.append(f"缺少 ASIN {missing_asin} 条")
+    if missing_sku:
+        missing_parts.append(f"缺少 SKU {missing_sku} 条")
+    return f"商品标识不完整, {', '.join(missing_parts)}; 请先修复采集或解析结果再通知。"
 
 
 def summary_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1283,6 +1301,10 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
         if coverage_error:
             status = "coverage_failed"
             error = coverage_error
+            candidates = []
+        elif should_require_complete_product_ids(config) and (quality_error := product_quality_failure_message(coverage_summary)):
+            status = "quality_failed"
+            error = quality_error
             candidates = []
         else:
             candidates = select_notify_candidates(conn, items)
