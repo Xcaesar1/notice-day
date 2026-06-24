@@ -1058,6 +1058,23 @@ def build_coverage_summary(config: dict[str, Any], args: argparse.Namespace, ite
     return summary
 
 
+def fallback_coverage_summary(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    items: list[ImpactItem],
+    error: str,
+) -> dict[str, Any]:
+    source_config = config.get("source", {})
+    store_list_path = Path(getattr(args, "store_list", "") or source_config.get("store_list_path") or "")
+    target_site = getattr(args, "site", "") or source_config.get("site") or SITE_US
+    summary = summarize_items(items, expected_stores=[])
+    summary["coverage_ok"] = False
+    summary["store_list_path"] = str(store_list_path)
+    summary["target_site"] = target_site
+    summary["error"] = clean_text(error)
+    return summary
+
+
 def selected_source_type(config: dict[str, Any], args: argparse.Namespace) -> str:
     source_config = config.get("source", {})
     if getattr(args, "source_excel", ""):
@@ -1089,6 +1106,8 @@ def coverage_failure_message(summary: dict[str, Any]) -> str:
 
 def summary_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    if summary.get("error"):
+        rows.append({"维度": "解析错误", "名称": summary.get("error", ""), "数量": 0})
     for store, count in summary.get("by_store", {}).items():
         rows.append({"维度": "店铺", "名称": store, "数量": count})
     for category, count in summary.get("by_category", {}).items():
@@ -1190,20 +1209,38 @@ def execute_parse(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path) if config_path.is_file() else default_config()
     run_id = run_id_text()
-    items, source = load_items(config, args)
-    item_rows = [item.to_row(run_id, "parsed") for item in items]
-    summary = build_coverage_summary(config, args, items)
     result_dir = Path(args.output_dir or config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
     artifact = result_dir / f"account-health-parse-{run_id}.xlsx"
+    source = getattr(args, "source_excel", "") or getattr(args, "source_dir", "") or config.get("source", {}).get("excel_path") or config.get("source", {}).get("excel_dir") or "unknown"
+    try:
+        items, source = load_items(config, args)
+        item_rows = [item.to_row(run_id, "parsed") for item in items]
+        try:
+            summary = build_coverage_summary(config, args, items)
+            coverage_error = coverage_failure_message(summary) if args.require_all_stores else ""
+            status = "coverage_failed" if coverage_error else "success"
+            error = ""
+        except Exception as exc:
+            error = f"store_list_invalid: {exc}"
+            summary = fallback_coverage_summary(config, args, items, error)
+            coverage_error = error
+            status = "failed"
+    except Exception as exc:
+        item_rows = []
+        error = str(exc)
+        summary = fallback_coverage_summary(config, args, [], error)
+        coverage_error = ""
+        status = "failed"
     write_parse_xlsx(artifact, item_rows, summary)
-    coverage_error = coverage_failure_message(summary) if args.require_all_stores else ""
-    ok = not coverage_error
+    ok = status == "success"
     return {
         "ok": ok,
+        "status": status,
         "run_id": run_id,
         "source": source,
         "artifact": str(artifact),
         "coverage_error": coverage_error,
+        "error": error,
         **summary,
     }
 
@@ -1214,8 +1251,6 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
     db_path = Path(config.get("state", {}).get("db_path") or state_dir / "state.sqlite")
     conn = connect_db(db_path)
-    retention_days = int(config.get("notify", {}).get("dedupe_retention_days") or 90)
-    prune_old_items(conn, retention_days)
 
     run_id = run_id_text()
     started_at = now_text()
@@ -1228,6 +1263,13 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     coverage_summary: dict[str, Any] = {}
 
     try:
+        try:
+            retention_days = int(config.get("notify", {}).get("dedupe_retention_days") or 90)
+            if retention_days <= 0:
+                raise ValueError
+        except Exception:
+            raise ValueError("dedupe_retention_days 必须是正整数")
+        prune_old_items(conn, retention_days)
         items, source = load_items(config, args)
         write_run_start(conn, run_id, started_at, source)
         coverage_summary = build_coverage_summary(config, args, items)

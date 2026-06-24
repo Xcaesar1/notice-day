@@ -205,6 +205,81 @@ class ExcelEndToEndTests(unittest.TestCase):
 
             self.assertEqual(selected, source)
 
+    def test_parse_missing_excel_returns_failure_report_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "out"
+            args = argparse.Namespace(
+                config=str(root / "missing-config.json"),
+                state_dir=str(root),
+                source_type="excel",
+                source_excel=str(root / "missing.xlsx"),
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                output_dir=str(output_dir),
+                require_all_stores=False,
+            )
+
+            result = notifier.execute_parse(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["total_items"], 0)
+            self.assertIn("missing.xlsx", result["error"])
+            self.assertTrue(Path(result["artifact"]).is_file())
+
+    def test_parse_invalid_store_list_keeps_items_and_returns_failure_report(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_excel = root / "source.xlsx"
+            store_list = root / "stores.xlsx"
+            output_dir = root / "out"
+            write_single_sheet_xlsx(
+                source_excel,
+                "异常明细",
+                [
+                    "店铺",
+                    "站点",
+                    "异常分类",
+                    "原因",
+                    "日期",
+                    "哪些商品会受到影响？",
+                ],
+                [
+                    {
+                        "店铺": "BYF",
+                        "站点": notifier.SITE_US,
+                        "异常分类": "食品和商品安全问题",
+                        "原因": "安全饮用水法案",
+                        "日期": "2026-01-30",
+                        "哪些商品会受到影响？": "ASIN: B0FPKWYF49 SKU: BF-9901-BN",
+                    }
+                ],
+            )
+            store_list.write_text("not an xlsx", encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(root / "missing-config.json"),
+                state_dir=str(root),
+                source_type="excel",
+                source_excel=str(source_excel),
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list=str(store_list),
+                output_dir=str(output_dir),
+                require_all_stores=True,
+            )
+
+            result = notifier.execute_parse(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["total_items"], 1)
+            self.assertIn("store_list", result["error"])
+            workbook = notifier.read_xlsx_workbook(Path(result["artifact"]))
+            detail_rows = notifier.rows_to_dicts(workbook["全店铺明细"])
+            self.assertEqual(len(detail_rows), 1)
+
 
 class RunIdTests(unittest.TestCase):
     def test_run_id_has_microsecond_precision(self) -> None:
@@ -258,6 +333,40 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual(result["status"], "coverage_failed")
             self.assertEqual(result["notify_candidates"], 0)
             self.assertIn("Hangoro", result["error"])
+
+    def test_run_reports_invalid_retention_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["dingtalk"]["send_enabled"] = False
+            config["notify"]["require_all_stores_before_send"] = False
+            config["notify"]["dedupe_retention_days"] = "abc"
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=True,
+                send=False,
+            )
+
+            result = notifier.execute_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "failed")
+            self.assertIn("dedupe_retention_days", result["error"])
+            self.assertEqual(result["notify_candidates"], 0)
+            self.assertTrue(Path(result["artifact"]).is_file())
 
 
 class ConfigValidationTests(unittest.TestCase):
