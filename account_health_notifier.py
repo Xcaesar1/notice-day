@@ -912,6 +912,92 @@ def update_run_artifacts(
     return result_path
 
 
+def issue(code: str, message: str, severity: str = "error") -> dict[str, str]:
+    return {"code": code, "severity": severity, "message": message}
+
+
+def validate_runtime_config(
+    config_path: Path,
+    config: dict[str, Any],
+    state_dir: Path,
+    require_send_ready: bool = False,
+) -> dict[str, Any]:
+    issues: list[dict[str, str]] = []
+    if not config_path.is_file():
+        issues.append(issue("config_missing", f"配置文件不存在: {config_path}"))
+
+    source = config.get("source", {})
+    source_type = source.get("type") or "excel_latest"
+    if source_type == "excel":
+        excel_path = Path(source.get("excel_path") or "")
+        if not excel_path.is_file():
+            issues.append(issue("source_excel_missing", f"指定 Excel 不存在: {excel_path}"))
+    elif source_type == "excel_latest":
+        excel_dir = Path(source.get("excel_dir") or "")
+        if not excel_dir.is_dir():
+            issues.append(issue("source_excel_dir_missing", f"结果目录不存在: {excel_dir}"))
+    elif source_type == "bridge":
+        issues.append(issue("bridge_not_implemented", "bridge 采集入口当前版本尚未接入"))
+
+    if config.get("notify", {}).get("require_all_stores_before_send", False):
+        store_list_path = Path(source.get("store_list_path") or "")
+        if not store_list_path.is_file():
+            issues.append(issue("store_list_missing", f"店铺清单不存在: {store_list_path}"))
+        else:
+            try:
+                expected_stores = load_expected_stores(store_list_path, source.get("site") or SITE_US)
+                if not expected_stores:
+                    issues.append(issue("store_list_empty", f"店铺清单没有目标站点店铺: {store_list_path}"))
+            except Exception as exc:
+                issues.append(issue("store_list_invalid", f"店铺清单读取失败: {exc}"))
+
+    dingtalk = config.get("dingtalk", {})
+    dws_call = Path(dingtalk.get("dws_call") or DEFAULT_DWS_CALL)
+    if not dws_call.is_file():
+        issues.append(issue("dws_call_missing", f"DWS 调用入口不存在: {dws_call}"))
+
+    notify = config.get("notify", {})
+    try:
+        if int(notify.get("max_items_per_message") or 0) <= 0:
+            issues.append(issue("max_items_per_message_invalid", "max_items_per_message 必须大于 0"))
+    except Exception:
+        issues.append(issue("max_items_per_message_invalid", "max_items_per_message 必须是正整数"))
+    try:
+        if int(notify.get("dedupe_retention_days") or 0) <= 0:
+            issues.append(issue("dedupe_retention_days_invalid", "dedupe_retention_days 必须大于 0"))
+    except Exception:
+        issues.append(issue("dedupe_retention_days_invalid", "dedupe_retention_days 必须是正整数"))
+
+    schedule = config.get("schedule", {})
+    try:
+        if int(schedule.get("interval_hours") or 0) <= 0:
+            issues.append(issue("interval_hours_invalid", "interval_hours 必须大于 0"))
+    except Exception:
+        issues.append(issue("interval_hours_invalid", "interval_hours 必须是正整数"))
+
+    db_path = Path(config.get("state", {}).get("db_path") or state_dir / "state.sqlite")
+    result_dir = Path(config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
+
+    if require_send_ready:
+        if not clean_text(dingtalk.get("robot_code")):
+            issues.append(issue("robot_code_missing", "缺少 dingtalk.robot_code"))
+        if not clean_text(dingtalk.get("group_open_conversation_id")):
+            issues.append(issue("group_open_conversation_id_missing", "缺少 dingtalk.group_open_conversation_id"))
+        if not bool(dingtalk.get("send_enabled", False)):
+            issues.append(issue("send_enabled_false", "定时真实通知需要 dingtalk.send_enabled=true"))
+
+    ok = not any(item["severity"] == "error" for item in issues)
+    return {
+        "ok": ok,
+        "require_send_ready": require_send_ready,
+        "config_path": str(config_path),
+        "state_dir": str(state_dir),
+        "db_path": str(db_path),
+        "result_dir": str(result_dir),
+        "issues": issues,
+    }
+
+
 def summarize_items(items: list[ImpactItem], expected_stores: list[str] | None = None) -> dict[str, Any]:
     by_store: dict[str, int] = {}
     by_category: dict[str, int] = {}
@@ -1255,8 +1341,21 @@ def execute_doctor(args: argparse.Namespace) -> dict[str, Any]:
             }
         except Exception as exc:
             dws_status = {"error": str(exc)}
-    ok = checks["dws_call_exists"]
-    return {"ok": ok, "checks": checks, "dws_auth_status": dws_status}
+    validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=False)
+    ok = checks["dws_call_exists"] and validation["ok"]
+    return {"ok": ok, "checks": checks, "validation": validation, "dws_auth_status": dws_status}
+
+
+def execute_validate_config(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
+    return validate_runtime_config(
+        config_path,
+        config,
+        state_dir,
+        require_send_ready=bool(args.require_send_ready),
+    )
 
 
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
@@ -1279,6 +1378,7 @@ def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
 def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH).resolve()
     config = load_config(config_path)
+    state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
     schedule = config.get("schedule", {})
     task_name = args.task_name or schedule.get("task_name") or DEFAULT_TASK_NAME
     interval = int(args.interval_hours or schedule.get("interval_hours") or 6)
@@ -1298,8 +1398,17 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
         command,
         "/F",
     ]
+    validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=True)
+    if not validation["ok"] and not getattr(args, "skip_preflight", False):
+        return {
+            "ok": False,
+            "status": "preflight_failed",
+            "dry_run": bool(args.dry_run),
+            "command": schtasks_args,
+            "issues": validation["issues"],
+        }
     if args.dry_run:
-        return {"ok": True, "dry_run": True, "command": schtasks_args}
+        return {"ok": True, "status": "dry_run", "dry_run": True, "command": schtasks_args, "issues": validation["issues"]}
     result = subprocess.run(schtasks_args, text=True, encoding="utf-8", errors="replace", capture_output=True)
     return {
         "ok": result.returncode == 0,
@@ -1407,6 +1516,11 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(doctor)
     doctor.set_defaults(func=execute_doctor)
 
+    validate_config = sub.add_parser("validate-config", help="检查本地配置是否可用于运行或定时通知")
+    add_common(validate_config)
+    validate_config.add_argument("--require-send-ready", action="store_true", help="要求机器人和群配置已满足真实通知")
+    validate_config.set_defaults(func=execute_validate_config)
+
     run = sub.add_parser("run", help="执行采集、去重和通知")
     add_common(run)
     run.add_argument("--source-type", choices=["excel", "excel_latest", "sample", "bridge"], default="")
@@ -1442,6 +1556,7 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("--task-name", default="", help="任务计划名称")
     schedule.add_argument("--interval-hours", default="", help="执行间隔小时数")
     schedule.add_argument("--python", default="", help="Python 可执行文件")
+    schedule.add_argument("--skip-preflight", action="store_true", help="跳过配置预检, 仅用于排障")
     schedule.set_defaults(func=execute_install_schedule)
 
     self_test = sub.add_parser("self-test", help="运行本地去重和 dry-run 自测")

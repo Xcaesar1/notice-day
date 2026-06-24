@@ -243,6 +243,77 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertIn("Hangoro", result["error"])
 
 
+class ConfigValidationTests(unittest.TestCase):
+    def _base_config_path(self, root: Path) -> Path:
+        source_dir = root / "source"
+        source_dir.mkdir()
+        store_list = root / "stores.xlsx"
+        dws_call = root / "dws.cmd"
+        dws_call.write_text("@echo off\r\necho {}\r\nexit /b 0\r\n", encoding="utf-8")
+        write_single_sheet_xlsx(
+            store_list,
+            "搴楅摵鎵ц娓呭崟",
+            ["搴楅摵", "绔欑偣"],
+            [{"搴楅摵": "BYF", "绔欑偣": notifier.SITE_US}],
+        )
+        config = notifier.default_config()
+        config["source"]["excel_dir"] = str(source_dir)
+        config["source"]["store_list_path"] = str(store_list)
+        config["dingtalk"]["dws_call"] = str(dws_call)
+        config["dingtalk"]["send_enabled"] = False
+        config["state"]["db_path"] = str(root / "state.sqlite")
+        config["state"]["result_dir"] = str(root / "runs")
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        return config_path
+
+    def test_validate_config_requires_robot_group_and_send_enabled_for_send_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            args = argparse.Namespace(config=str(config_path), state_dir=str(root), require_send_ready=True)
+
+            result = notifier.execute_validate_config(args)
+
+            codes = {issue["code"] for issue in result["issues"]}
+            self.assertFalse(result["ok"])
+            self.assertIn("robot_code_missing", codes)
+            self.assertIn("group_open_conversation_id_missing", codes)
+            self.assertIn("send_enabled_false", codes)
+
+    def test_validate_config_reports_missing_config_without_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = argparse.Namespace(config=str(root / "missing.json"), state_dir=str(root), require_send_ready=False)
+
+            result = notifier.execute_validate_config(args)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("config_missing", {issue["code"] for issue in result["issues"]})
+
+    def test_install_schedule_dry_run_refuses_incomplete_send_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                dry_run=True,
+                task_name="",
+                interval_hours="",
+                python="",
+                skip_preflight=False,
+            )
+
+            result = notifier.execute_install_schedule(args)
+
+            self.assertFalse(result["ok"])
+            self.assertTrue(result["dry_run"])
+            self.assertEqual(result["status"], "preflight_failed")
+            self.assertIn("command", result)
+            self.assertIn("robot_code_missing", {issue["code"] for issue in result["issues"]})
+
+
 class SendFailureTests(unittest.TestCase):
     def _write_config(self, root: Path, dws_call: Path) -> Path:
         config = notifier.default_config()

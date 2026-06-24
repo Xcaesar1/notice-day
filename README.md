@@ -24,6 +24,8 @@
 Set-Location Q:\notice-day
 python account_health_notifier.py init-config --config .local-state\account-health-notifier\config.json
 python account_health_notifier.py doctor --json
+python account_health_notifier.py validate-config --json
+python account_health_notifier.py validate-config --require-send-ready --json
 ```
 
 初始化后编辑 `.local-state\account-health-notifier\config.json`, 填入:
@@ -42,6 +44,10 @@ python account_health_notifier.py self-test --json
 
 # 从最新 Excel dry-run, 不真实发钉钉
 python account_health_notifier.py run --dry-run --json
+
+# 配置预检, 第二条会要求机器人和群配置满足真实定时通知
+python account_health_notifier.py validate-config --json
+python account_health_notifier.py validate-config --require-send-ready --json
 
 # sample 自测不代表全店铺覆盖, 需要显式跳过覆盖校验
 python account_health_notifier.py run --source-type sample --dry-run --skip-store-coverage --json
@@ -64,6 +70,7 @@ python account_health_notifier.py install-schedule --json
 
 启用真实定时通知前, 建议先运行 `parse --require-all-stores`: 只有 `coverage_ok=true` 时才代表本次结果覆盖店铺清单里的全部美国站店铺。
 正式 `run` 默认启用 `require_all_stores_before_send`; 如果店铺清单无法读取或美国站店铺缺失, 会返回 `coverage_failed` 并且不会进入钉钉发送。
+`install-schedule` 默认会执行 `--require-send-ready` 级别预检; 缺少机器人, 群 ID 或 `send_enabled=true` 时会返回 `preflight_failed`, 不会安装任务计划。
 
 ## 安全边界
 
