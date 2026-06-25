@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from unittest import mock
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import account_health_notifier as notifier  # noqa: E402
+import ziniao_cdp  # noqa: E402
 
 
 def write_single_sheet_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[str, str]]) -> None:
@@ -98,6 +100,71 @@ class CoverageSummaryTests(unittest.TestCase):
         self.assertEqual(summary["store_count"], 1)
         self.assertEqual(summary["missing_stores"], ["Hangoro"])
         self.assertEqual(summary["missing_asin"], 0)
+
+
+class ZiniaoCdpTests(unittest.TestCase):
+    def test_find_targets_returns_only_matching_seller_pages(self) -> None:
+        with mock.patch.object(
+            ziniao_cdp,
+            "scan_ports",
+            return_value=[
+                ziniao_cdp.CdpBrowser(
+                    port=9222,
+                    browser="Chrome/138.0.7204.252",
+                    protocol_version="1.3",
+                    web_socket_debugger_url="ws://127.0.0.1:9222/devtools/browser/x",
+                )
+            ],
+        ), mock.patch.object(
+            ziniao_cdp,
+            "list_targets",
+            return_value=[
+                ziniao_cdp.CdpTarget(
+                    port=9222,
+                    id="seller",
+                    type="page",
+                    title="新的亚马逊销售体验",
+                    url="https://sellercentral.amazon.com/amazonsell/business",
+                    web_socket_debugger_url="ws://127.0.0.1:9222/devtools/page/seller",
+                ),
+                ziniao_cdp.CdpTarget(
+                    port=9222,
+                    id="extension",
+                    type="page",
+                    title="BYF|亚马逊-美国",
+                    url="chrome-extension://dmgckiokdaggcmhfbagamdbkhflkdnah/index.html",
+                    web_socket_debugger_url="ws://127.0.0.1:9222/devtools/page/extension",
+                ),
+            ],
+        ):
+            targets = ziniao_cdp.find_targets()
+
+        self.assertEqual([target.id for target in targets], ["seller"])
+
+    def test_cdp_smoke_uses_config_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["ziniao_cdp"]["port"] = 9333
+            config["ziniao_cdp"]["url_contains"] = "sellercentral.amazon.com"
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                port=0,
+                port_start=0,
+                port_end=0,
+                url_contains="",
+                text_limit=0,
+            )
+            with mock.patch.object(ziniao_cdp, "probe_payload", return_value={"ok": True, "probe": {}}) as mocked:
+                result = notifier.execute_cdp_smoke(args)
+
+        self.assertTrue(result["ok"])
+        passed = mocked.call_args.args[0]
+        self.assertEqual(passed.port, 9333)
+        self.assertEqual(passed.url_contains, "sellercentral.amazon.com")
 
 
 class ExcelEndToEndTests(unittest.TestCase):

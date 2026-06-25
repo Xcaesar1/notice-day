@@ -4,6 +4,7 @@
 
 当前版本用于 Office-PC 本地定时运行:
 
+- 通过紫鸟浏览器 CDP 直连能力检查 Seller Central 页面是否可读。
 - 从账号状况结果 Excel 读取未解决异常明细。
 - 提取受影响商品的 ASIN 和 SKU。
 - 用 SQLite 记录已通知项, 新增或核心内容变化才再次通知。
@@ -49,6 +50,10 @@ python account_health_notifier.py run --dry-run --json
 python account_health_notifier.py validate-config --json
 python account_health_notifier.py validate-config --require-send-ready --json
 
+# 紫鸟 CDP 直连 smoke: 不读 Cookie/token, 只读当前 Seller Central 页面的 title/url/body 摘要
+python account_health_notifier.py cdp-smoke --json
+python ziniao_cdp.py probe --json --port 9222
+
 # sample 自测不代表全店铺覆盖, 需要显式跳过覆盖校验
 python account_health_notifier.py run --source-type sample --dry-run --skip-store-coverage --json
 
@@ -74,6 +79,8 @@ python account_health_notifier.py install-schedule --json
 
 ## 安全边界
 
+- CDP 能读取浏览器页面和登录态上下文, 排障命令默认不读取 Cookie/token, 日志和提交中也不能写入 Cookie/token。
+- 紫鸟 CDP 守护进程必须先于店铺浏览器启动; 已打开且未带 `--remote-debugging-port` 的旧窗口需要关闭后重开。
 - 脚本不创建群, 不添加机器人, 不修改群成员。
 - 缺少 `robot_code` 或 `group_open_conversation_id` 时不能真实发送。
 - `send_enabled=false` 时, `run` 默认 dry-run; 需要真实发送时使用 `--send` 或将配置改为 `true`。

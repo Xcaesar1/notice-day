@@ -7,6 +7,13 @@
     "site": "美国",
     "max_excel_age_hours": 30
   },
+  "ziniao_cdp": {
+    "port": 0,
+    "port_start": 9222,
+    "port_end": 9250,
+    "url_contains": "sellercentral.amazon.com",
+    "text_limit": 800
+  },
   "dingtalk": {
     "dws_call": "Q:\\Dingcli\\dws-call.cmd",
     "robot_code": "",

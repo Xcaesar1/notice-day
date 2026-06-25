@@ -20,6 +20,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import html
 import xml.etree.ElementTree as ET
 
+import ziniao_cdp
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_STATE_DIR = PROJECT_ROOT / ".local-state" / "account-health-notifier"
@@ -211,6 +213,13 @@ def default_config() -> dict[str, Any]:
             "store_list_path": str(DEFAULT_STORE_LIST),
             "site": SITE_US,
             "max_excel_age_hours": 30,
+        },
+        "ziniao_cdp": {
+            "port": 0,
+            "port_start": 9222,
+            "port_end": 9250,
+            "url_contains": "sellercentral.amazon.com",
+            "text_limit": 800,
         },
         "dingtalk": {
             "dws_call": str(DEFAULT_DWS_CALL),
@@ -1536,6 +1545,25 @@ def execute_validate_config(args: argparse.Namespace) -> dict[str, Any]:
     )
 
 
+def execute_cdp_smoke(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    cdp_config = config.get("ziniao_cdp", {})
+    port = int(args.port or cdp_config.get("port") or 0)
+    port_start = int(args.port_start or cdp_config.get("port_start") or ziniao_cdp.DEFAULT_PORT_START)
+    port_end = int(args.port_end or cdp_config.get("port_end") or ziniao_cdp.DEFAULT_PORT_END)
+    url_contains = args.url_contains or cdp_config.get("url_contains") or ziniao_cdp.DEFAULT_URL_CONTAINS
+    text_limit = int(args.text_limit or cdp_config.get("text_limit") or 800)
+    probe_args = argparse.Namespace(
+        port=port,
+        port_start=port_start,
+        port_end=port_end,
+        url_contains=url_contains,
+        text_limit=text_limit,
+    )
+    return ziniao_cdp.probe_payload(probe_args)
+
+
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path)
@@ -1693,6 +1721,9 @@ def execute_self_test(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def print_result(payload: dict[str, Any], as_json: bool) -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if as_json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
@@ -1748,6 +1779,15 @@ def build_parser() -> argparse.ArgumentParser:
     parse.add_argument("--output-dir", default="", help="解析报告输出目录")
     parse.add_argument("--require-all-stores", action="store_true", help="店铺覆盖不完整时返回失败")
     parse.set_defaults(func=execute_parse)
+
+    cdp_smoke = sub.add_parser("cdp-smoke", help="检查紫鸟 CDP 端口和 Seller Central 页面只读访问")
+    add_common(cdp_smoke)
+    cdp_smoke.add_argument("--port", type=int, default=0, help="指定 CDP 端口, 不指定则扫描")
+    cdp_smoke.add_argument("--port-start", type=int, default=0, help="扫描起始端口")
+    cdp_smoke.add_argument("--port-end", type=int, default=0, help="扫描结束端口")
+    cdp_smoke.add_argument("--url-contains", default="", help="目标页面 URL 片段")
+    cdp_smoke.add_argument("--text-limit", type=int, default=0, help="页面正文摘要长度")
+    cdp_smoke.set_defaults(func=execute_cdp_smoke)
 
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)
