@@ -64,6 +64,12 @@ python account_health_notifier.py cdp-lifecycle-test --json
 python account_health_notifier.py cdp-collect-current --json --port 9222
 python account_health_notifier.py cdp-collect-current --json --port 9222 --categories safe --start-date 2026-06-01 --end-date 2026-06-25
 
+# CDP multi-open-window collection. It scans currently open Ziniao Seller Central targets,
+# collects current-month issues, writes Excel/JSON, and marks unopened US stores as missing.
+python account_health_notifier.py cdp-collect-open --json
+python account_health_notifier.py cdp-collect-open --json --require-all-open
+python account_health_notifier.py cdp-collect-open --json --categories safe,restricted --output-dir .local-state\account-health-notifier\runs\cdp-open-smoke
+
 # 安装紫鸟 CDP daemon 登录自启, 先 dry-run 查看 schtasks 命令
 python account_health_notifier.py install-cdp-daemon --dry-run --json
 python account_health_notifier.py install-cdp-daemon --json

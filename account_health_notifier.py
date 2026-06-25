@@ -84,6 +84,20 @@ PARSE_SUMMARY_HEADERS = [
     "数量",
 ]
 
+CDP_TARGET_HEADERS = [
+    "run_id",
+    "store",
+    "site",
+    "status",
+    "row_count",
+    "error",
+    "target_port",
+    "target_title",
+    "target_url",
+    "started_at",
+    "ended_at",
+]
+
 HEADER_ALIASES = {
     "店铺": {"店铺", "搴楅摵"},
     "站点": {"站点", "绔欑偣"},
@@ -1333,6 +1347,108 @@ def write_parse_xlsx(path: Path, item_rows: list[dict[str, Any]], summary: dict[
     return str(path)
 
 
+def write_collect_open_xlsx(
+    path: Path,
+    item_rows: list[dict[str, Any]],
+    target_rows: list[dict[str, Any]],
+    summary: dict[str, Any],
+) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    created = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    sheets = [
+        ("CDP Items", ITEM_HEADERS, item_rows),
+        ("Target Results", CDP_TARGET_HEADERS, target_rows),
+        ("Coverage", PARSE_SUMMARY_HEADERS, summary_rows(summary)),
+    ]
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        overrides = "".join(
+            f'<Override PartName="/xl/worksheets/sheet{index}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for index in range(1, len(sheets) + 1)
+        )
+        archive.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
+            '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
+            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            f"{overrides}"
+            '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+            "</Types>",
+        )
+        archive.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+            '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>'
+            '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "docProps/core.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" '
+            'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+            'xmlns:dcterms="http://purl.org/dc/terms/" '
+            'xmlns:dcmitype="http://purl.org/dc/dcmitype/" '
+            'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">'
+            "<dc:creator>YD-MCP</dc:creator>"
+            f'<dcterms:created xsi:type="dcterms:W3CDTF">{created}</dcterms:created>'
+            f'<dcterms:modified xsi:type="dcterms:W3CDTF">{created}</dcterms:modified>'
+            "</cp:coreProperties>",
+        )
+        archive.writestr(
+            "docProps/app.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties" '
+            'xmlns:vt="http://schemas.openxmlformats.org/officeDocument/2006/docPropsVTypes">'
+            "<Application>YD-MCP</Application></Properties>",
+        )
+        sheet_nodes = "".join(
+            f'<sheet name="{html.escape(name, quote=True)}" sheetId="{index}" r:id="rId{index}"/>'
+            for index, (name, _headers, _rows) in enumerate(sheets, start=1)
+        )
+        archive.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f"<sheets>{sheet_nodes}</sheets>"
+            "</workbook>",
+        )
+        rel_nodes = "".join(
+            f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{index}.xml"/>'
+            for index in range(1, len(sheets) + 1)
+        )
+        archive.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f"{rel_nodes}"
+            f'<Relationship Id="rId{len(sheets) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+            "</Relationships>",
+        )
+        archive.writestr(
+            "xl/styles.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+            '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+            '<borders count="1"><border/></borders>'
+            '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+            '<cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>'
+            "</styleSheet>",
+        )
+        for index, (_name, headers, rows) in enumerate(sheets, start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", _worksheet_xml(headers, rows))
+    return str(path)
+
+
 def execute_parse(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path) if config_path.is_file() else default_config()
@@ -1702,6 +1818,218 @@ def execute_cdp_collect_current(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def cdp_target_public_dict(target: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "port": target.get("port", ""),
+        "id": target.get("id", ""),
+        "type": target.get("type", ""),
+        "title": target.get("title", ""),
+        "url": target.get("url", ""),
+    }
+
+
+def sanitized_target_result(result: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(result)
+    sanitized["target"] = cdp_target_public_dict(dict(result.get("target") or {}))
+    return sanitized
+
+
+def cdp_target_result_rows(run_id: str, target_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in target_results:
+        target = dict(result.get("target") or {})
+        rows.append(
+            {
+                "run_id": run_id,
+                "store": result.get("store", ""),
+                "site": result.get("site", ""),
+                "status": result.get("status", ""),
+                "row_count": result.get("row_count", 0),
+                "error": result.get("error", ""),
+                "target_port": target.get("port", ""),
+                "target_title": target.get("title", ""),
+                "target_url": target.get("url", ""),
+                "started_at": result.get("started_at", ""),
+                "ended_at": result.get("ended_at", ""),
+            }
+        )
+    return rows
+
+
+def load_cdp_expected_stores(
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    target_site: str,
+) -> tuple[list[str], str, str]:
+    if getattr(args, "skip_store_list", False):
+        return [], "", ""
+    source_config = config.get("source", {})
+    store_list_path = Path(getattr(args, "store_list", "") or source_config.get("store_list_path") or "")
+    if not store_list_path.is_file():
+        return [], str(store_list_path), f"store_list_missing: {store_list_path}"
+    return load_expected_stores(store_list_path, target_site), str(store_list_path), ""
+
+
+def site_matches(value: str, target_site: str) -> bool:
+    return normalize_for_key(value or target_site) == normalize_for_key(target_site)
+
+
+def cdp_open_summary(
+    items: list[ImpactItem],
+    expected_stores: list[str],
+    target_results: list[dict[str, Any]],
+    target_site: str,
+    store_list_path: str,
+    store_list_error: str = "",
+) -> dict[str, Any]:
+    summary = summarize_items(items, expected_stores=[])
+    opened_stores: list[str] = []
+    opened_keys: set[str] = set()
+    failed_targets = 0
+    for result in target_results:
+        if not result.get("ok"):
+            failed_targets += 1
+            continue
+        store = clean_text(result.get("store"))
+        site = clean_text(result.get("site")) or target_site
+        if not store or not site_matches(site, target_site):
+            continue
+        key = normalize_for_key(store)
+        if key in opened_keys:
+            continue
+        opened_keys.add(key)
+        opened_stores.append(store)
+    missing_stores = [
+        store for store in expected_stores if normalize_for_key(store) not in opened_keys
+    ]
+    extra_stores = [
+        store for store in opened_stores if normalize_for_key(store) not in {normalize_for_key(item) for item in expected_stores}
+    ] if expected_stores else []
+    summary.update(
+        {
+            "expected_store_count": len(expected_stores),
+            "opened_store_count": len(opened_stores),
+            "opened_stores": opened_stores,
+            "missing_stores": missing_stores,
+            "extra_stores": extra_stores,
+            "coverage_ok": not expected_stores or not missing_stores,
+            "target_site": target_site,
+            "store_list_path": store_list_path,
+            "store_list_error": store_list_error,
+            "target_count": len(target_results),
+            "failed_target_count": failed_targets,
+        }
+    )
+    return summary
+
+
+def execute_cdp_collect_open(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    cdp_args = build_cdp_args(config, args)
+    start_date = clean_text(args.start_date)
+    end_date = clean_text(args.end_date)
+    if not start_date or not end_date:
+        start_date, end_date = cdp_account_health.current_month_range()
+    cdp_config = config.get("ziniao_cdp", {})
+    source_config = config.get("source", {})
+    target_site = clean_text(args.site) or clean_text(source_config.get("site")) or SITE_US
+    page_size = int(args.page_size or cdp_config.get("collect_page_size") or cdp_account_health.DEFAULT_PAGE_SIZE)
+    max_pages = int(args.max_pages or cdp_config.get("collect_max_pages") or cdp_account_health.DEFAULT_MAX_PAGES)
+    categories = cdp_account_health.selected_categories(args.categories)
+    expected_stores, store_list_path, store_list_error = load_cdp_expected_stores(config, args, target_site)
+
+    collection = cdp_account_health.collect_open_account_health(
+        cdp_args,
+        start_date=start_date,
+        end_date=end_date,
+        categories=categories,
+        page_size=page_size,
+        max_pages=max_pages,
+    )
+    run_id = run_id_text()
+    target_results = [sanitized_target_result(result) for result in collection.get("target_results", [])]
+    source_file = "cdp-open"
+    items = [
+        impact_item_from_cdp_row(row, source_file)
+        for row in collection.get("rows", [])
+        if site_matches(clean_text(row.get("site")), target_site)
+    ]
+    item_rows = [item.to_row(run_id, "cdp_collected") for item in items]
+    target_rows = cdp_target_result_rows(run_id, target_results)
+    summary = cdp_open_summary(
+        items,
+        expected_stores=expected_stores,
+        target_results=target_results,
+        target_site=target_site,
+        store_list_path=store_list_path,
+        store_list_error=store_list_error,
+    )
+
+    coverage_error = ""
+    if store_list_error and getattr(args, "require_all_open", False):
+        coverage_error = store_list_error
+    elif getattr(args, "require_all_open", False):
+        coverage_error = coverage_failure_message(summary)
+
+    target_failures = [result for result in target_results if not result.get("ok")]
+    if not target_results:
+        status = "no_targets"
+    elif target_failures:
+        status = "partial_failed"
+    elif coverage_error:
+        status = "coverage_failed"
+    elif summary.get("missing_stores"):
+        status = "partial"
+    else:
+        status = "success"
+    ok = bool(target_results) and not target_failures and not coverage_error
+
+    result_dir = Path(args.output_dir or config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
+    artifact = result_dir / f"account-health-cdp-open-{run_id}.xlsx"
+    write_collect_open_xlsx(artifact, item_rows, target_rows, summary)
+    json_artifact = result_dir / f"account-health-cdp-open-{run_id}.json"
+    json_artifact.parent.mkdir(parents=True, exist_ok=True)
+    json_payload = {
+        "run_id": run_id,
+        "status": status,
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_site": target_site,
+        "row_count": len(items),
+        "target_count": len(target_results),
+        "target_results": target_results,
+        "missing_stores": summary.get("missing_stores", []),
+        "opened_stores": summary.get("opened_stores", []),
+        "coverage_error": coverage_error,
+        "store_list_error": store_list_error,
+        "rows": [item.to_row(run_id, "cdp_collected") for item in items],
+    }
+    json_artifact.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    payload = {
+        "ok": ok,
+        "status": status,
+        "run_id": run_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_site": target_site,
+        "row_count": len(items),
+        "target_count": len(target_results),
+        "artifact": str(artifact),
+        "json_artifact": str(json_artifact),
+        "coverage_error": coverage_error,
+        "store_list_error": store_list_error,
+        "target_results": target_results,
+        **summary,
+    }
+    if args.include_items:
+        payload["items"] = [item.to_row(run_id, "cdp_collected") for item in items]
+    else:
+        payload["items_preview"] = [item.to_row(run_id, "cdp_collected") for item in items[:20]]
+    return payload
+
+
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path)
@@ -2019,6 +2347,26 @@ def build_parser() -> argparse.ArgumentParser:
     cdp_collect.add_argument("--output-dir", default="", help="output directory")
     cdp_collect.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
     cdp_collect.set_defaults(func=execute_cdp_collect_current)
+
+    cdp_collect_open = sub.add_parser("cdp-collect-open", help="Collect account health issues from all open Ziniao Seller Central CDP targets")
+    add_common(cdp_collect_open)
+    cdp_collect_open.add_argument("--port", type=int, default=0, help="CDP port")
+    cdp_collect_open.add_argument("--port-start", type=int, default=0, help="CDP scan start port")
+    cdp_collect_open.add_argument("--port-end", type=int, default=0, help="CDP scan end port")
+    cdp_collect_open.add_argument("--url-contains", default="", help="target page URL fragment")
+    cdp_collect_open.add_argument("--text-limit", type=int, default=0, help="page text limit")
+    cdp_collect_open.add_argument("--start-date", default="", help="start date YYYY-MM-DD, defaults to current month start")
+    cdp_collect_open.add_argument("--end-date", default="", help="end date YYYY-MM-DD, defaults to today")
+    cdp_collect_open.add_argument("--categories", default="all", help="all or comma-separated policy keys")
+    cdp_collect_open.add_argument("--page-size", type=int, default=0, help="API page size")
+    cdp_collect_open.add_argument("--max-pages", type=int, default=0, help="maximum pages per category")
+    cdp_collect_open.add_argument("--site", default="", help="target site")
+    cdp_collect_open.add_argument("--store-list", default="", help="store list used for US-site coverage")
+    cdp_collect_open.add_argument("--skip-store-list", action="store_true", help="skip store-list coverage")
+    cdp_collect_open.add_argument("--require-all-open", action="store_true", help="fail when expected US stores are not open")
+    cdp_collect_open.add_argument("--output-dir", default="", help="output directory")
+    cdp_collect_open.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
+    cdp_collect_open.set_defaults(func=execute_cdp_collect_open)
 
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)

@@ -227,6 +227,25 @@ class ZiniaoCdpTests(unittest.TestCase):
 
 
 class CdpAccountHealthCollectTests(unittest.TestCase):
+    def test_ziniao_extension_context_reads_store_and_us_site_from_extension_title(self) -> None:
+        with mock.patch.object(
+            ziniao_cdp,
+            "list_targets",
+            return_value=[
+                ziniao_cdp.CdpTarget(
+                    port=9222,
+                    id="extension",
+                    type="page",
+                    title="BYF|亚马逊-美国",
+                    url="chrome-extension://example/index.html",
+                    web_socket_debugger_url="ws://127.0.0.1:9222/devtools/page/extension",
+                )
+            ],
+        ):
+            context = cdp_account_health.ziniao_extension_context(9222)
+
+        self.assertEqual(context, {"store": "BYF", "site": notifier.SITE_US})
+
     def test_rows_from_violation_extracts_asin_sku_and_business_fields(self) -> None:
         category = cdp_account_health.PolicyCategory("safe", "食品和商品安全问题", "ProductSafety")
         violation = {
@@ -308,6 +327,102 @@ class CdpAccountHealthCollectTests(unittest.TestCase):
             self.assertTrue(Path(result["artifact"]).is_file())
             self.assertTrue(Path(result["json_artifact"]).is_file())
             self.assertEqual(result["items"][0]["ASIN"], "B0H4QD9255")
+
+    def test_execute_cdp_collect_open_writes_target_results_and_missing_open_stores(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store_list = root / "stores.xlsx"
+            write_single_sheet_xlsx(
+                store_list,
+                "店铺执行清单",
+                ["店铺", "站点"],
+                [
+                    {"店铺": "BYF", "站点": notifier.SITE_US},
+                    {"店铺": "Hangoro", "站点": notifier.SITE_US},
+                ],
+            )
+            config = notifier.default_config()
+            config["source"]["store_list_path"] = str(store_list)
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                port=9222,
+                port_start=0,
+                port_end=0,
+                url_contains="",
+                text_limit=0,
+                start_date="2026-06-01",
+                end_date="2026-06-25",
+                categories="safe",
+                page_size=25,
+                max_pages=2,
+                site=notifier.SITE_US,
+                store_list="",
+                skip_store_list=False,
+                require_all_open=False,
+                output_dir="",
+                include_items=True,
+            )
+            collection = {
+                "ok": True,
+                "status": "success",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-25",
+                "target_count": 1,
+                "rows": [
+                    {
+                        "store": "BYF",
+                        "site": notifier.SITE_US,
+                        "category": "食品和商品安全问题",
+                        "asin": "B0FPKWYF49",
+                        "sku": "BF-9901-BN",
+                        "reason": "安全饮用水法案",
+                        "date": "2026年6月10日",
+                        "impacted_text": "Product\nASIN: B0FPKWYF49\nSKU: BF-9901-BN",
+                        "sales_risk": "过去 12 个月无销量",
+                        "action": "商品已移除",
+                        "rating_impact": "无影响",
+                    }
+                ],
+                "target_results": [
+                    {
+                        "ok": True,
+                        "status": "success",
+                        "store": "BYF",
+                        "site": notifier.SITE_US,
+                        "row_count": 1,
+                        "error": "",
+                        "target": {
+                            "port": 9222,
+                            "id": "seller",
+                            "type": "page",
+                            "title": "亚马逊",
+                            "url": "https://sellercentral.amazon.com/performance/account/health/product-policies",
+                            "web_socket_debugger_url": "ws://127.0.0.1:9222/devtools/page/seller",
+                        },
+                        "page_reports": [{"category": "safe", "page": 1, "violations": 1}],
+                        "started_at": "2026-06-25 10:00:00",
+                        "ended_at": "2026-06-25 10:00:05",
+                    }
+                ],
+            }
+            with mock.patch.object(cdp_account_health, "collect_open_account_health", return_value=collection):
+                result = notifier.execute_cdp_collect_open(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "partial")
+            self.assertEqual(result["row_count"], 1)
+            self.assertEqual(result["opened_stores"], ["BYF"])
+            self.assertEqual(result["missing_stores"], ["Hangoro"])
+            self.assertNotIn("web_socket_debugger_url", result["target_results"][0]["target"])
+            self.assertTrue(Path(result["artifact"]).is_file())
+            self.assertTrue(Path(result["json_artifact"]).is_file())
+            workbook = notifier.read_xlsx_workbook(Path(result["artifact"]))
+            self.assertIn("Target Results", workbook)
+            self.assertEqual(notifier.rows_to_dicts(workbook["Target Results"])[0]["store"], "BYF")
 
 
 class ExcelEndToEndTests(unittest.TestCase):

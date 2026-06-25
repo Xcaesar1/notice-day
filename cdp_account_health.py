@@ -81,6 +81,51 @@ def find_target(args: argparse.Namespace) -> ziniao_cdp.CdpTarget:
     return targets[0]
 
 
+def find_targets(args: argparse.Namespace) -> list[ziniao_cdp.CdpTarget]:
+    return ziniao_cdp.find_targets(
+        url_contains=args.url_contains,
+        port=args.port or None,
+        port_start=args.port_start,
+        port_end=args.port_end,
+    )
+
+
+def dedupe_targets(targets: list[ziniao_cdp.CdpTarget]) -> list[ziniao_cdp.CdpTarget]:
+    deduped: list[ziniao_cdp.CdpTarget] = []
+    seen: set[tuple[str, str, str]] = set()
+    for target in targets:
+        key = (clean_text(target.id), clean_text(target.title), clean_text(target.url))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(target)
+    return deduped
+
+
+def ziniao_extension_context(port: int) -> dict[str, str]:
+    try:
+        targets = ziniao_cdp.list_targets(port)
+    except Exception:
+        return {"store": "", "site": ""}
+    for target in targets:
+        title = clean_text(target.title)
+        if "|" not in title:
+            continue
+        store, raw_site = [clean_text(part) for part in title.split("|", 1)]
+        if not store:
+            continue
+        site = ""
+        if "美国" in raw_site or "US" in raw_site.upper() or "United States" in raw_site:
+            site = "美国"
+        elif "加拿大" in raw_site or "CA" in raw_site.upper() or "Canada" in raw_site:
+            site = "加拿大"
+        elif "墨西哥" in raw_site or "MX" in raw_site.upper() or "Mexico" in raw_site:
+            site = "墨西哥"
+        if "亚马逊" in raw_site or "amazon" in raw_site.lower():
+            return {"store": store, "site": site}
+    return {"store": "", "site": ""}
+
+
 def navigate_to_product_policies(target: ziniao_cdp.CdpTarget, category_key: str = "safe", wait_seconds: float = 6.0) -> None:
     url = f"{PRODUCT_POLICIES_URL}?t={urllib.parse.quote(category_key)}"
     with ziniao_cdp.CdpSession(target.web_socket_debugger_url, timeout=20) as session:
@@ -258,11 +303,33 @@ def collect_current_account_health(
     site_override: str = "",
 ) -> dict[str, Any]:
     target = find_target(args)
+    return collect_target_account_health(
+        target,
+        start_date=start_date,
+        end_date=end_date,
+        categories=categories,
+        page_size=page_size,
+        max_pages=max_pages,
+        store_override=store_override,
+        site_override=site_override,
+    )
+
+
+def collect_target_account_health(
+    target: ziniao_cdp.CdpTarget,
+    start_date: str,
+    end_date: str,
+    categories: list[PolicyCategory],
+    page_size: int = DEFAULT_PAGE_SIZE,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    store_override: str = "",
+    site_override: str = "",
+) -> dict[str, Any]:
     navigate_to_product_policies(target, categories[0].key if categories else "safe")
-    target = find_target(args)
     context = page_context(target)
-    store = clean_text(store_override) or context.get("store") or "UNKNOWN_STORE"
-    site = clean_text(site_override) or context.get("site") or "美国"
+    extension_context = ziniao_extension_context(target.port)
+    store = clean_text(store_override) or extension_context.get("store") or context.get("store") or "UNKNOWN_STORE"
+    site = clean_text(site_override) or extension_context.get("site") or context.get("site") or "美国"
     rows: list[dict[str, str]] = []
     page_reports: list[dict[str, Any]] = []
     for category in categories:
@@ -307,5 +374,72 @@ def collect_current_account_health(
         "row_count": len(rows),
         "target": target.safe_dict(),
         "page_context": context,
+        "extension_context": extension_context,
         "page_reports": page_reports,
+    }
+
+
+def collect_open_account_health(
+    args: argparse.Namespace,
+    start_date: str,
+    end_date: str,
+    categories: list[PolicyCategory],
+    page_size: int = DEFAULT_PAGE_SIZE,
+    max_pages: int = DEFAULT_MAX_PAGES,
+) -> dict[str, Any]:
+    targets = dedupe_targets(find_targets(args))
+    results: list[dict[str, Any]] = []
+    rows: list[dict[str, str]] = []
+    for target in targets:
+        started_at = time.strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            result = collect_target_account_health(
+                target,
+                start_date=start_date,
+                end_date=end_date,
+                categories=categories,
+                page_size=page_size,
+                max_pages=max_pages,
+            )
+            ended_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            rows.extend(result.get("rows", []))
+            results.append(
+                {
+                    "ok": True,
+                    "status": "success",
+                    "store": result.get("store", ""),
+                    "site": result.get("site", ""),
+                    "row_count": result.get("row_count", 0),
+                    "error": "",
+                    "target": result.get("target", target.safe_dict()),
+                    "page_reports": result.get("page_reports", []),
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                }
+            )
+        except Exception as exc:
+            ended_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            results.append(
+                {
+                    "ok": False,
+                    "status": "failed",
+                    "store": "",
+                    "site": "",
+                    "row_count": 0,
+                    "error": clean_text(exc),
+                    "target": target.safe_dict(),
+                    "page_reports": [],
+                    "started_at": started_at,
+                    "ended_at": ended_at,
+                }
+            )
+    return {
+        "ok": all(item.get("ok") for item in results) if results else False,
+        "status": "success" if results and all(item.get("ok") for item in results) else "partial",
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_count": len(targets),
+        "rows": rows,
+        "row_count": len(rows),
+        "target_results": results,
     }
