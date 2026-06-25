@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import account_health_notifier as notifier  # noqa: E402
+import cdp_account_health  # noqa: E402
 import ziniao_cdp  # noqa: E402
 
 
@@ -223,6 +224,90 @@ class ZiniaoCdpTests(unittest.TestCase):
         self.assertEqual(result["status"], "dry_run")
         self.assertIn("ONLOGON", result["command"])
         self.assertIn("Test-ZiniaoCdpDaemon", result["command"])
+
+
+class CdpAccountHealthCollectTests(unittest.TestCase):
+    def test_rows_from_violation_extracts_asin_sku_and_business_fields(self) -> None:
+        category = cdp_account_health.PolicyCategory("safe", "食品和商品安全问题", "ProductSafety")
+        violation = {
+            "reason": {"reason": "安全饮用水法案: 食品和商品安全问题"},
+            "impactDate": {"formattedDate": "2026年6月10日"},
+            "affectedEntity": {
+                "title": "Bathroom Faucet",
+                "asins": ["B0H4QD9255"],
+                "skus": ["3314-BN-BASIC2"],
+            },
+            "gmsImpact": "过去 12 个月无销量",
+            "actionTaken": {"text": "商品已移除"},
+            "ahrImpact": "无影响",
+            "viewDetails": {"contentList": ["需要提交安全饮用水法案文件。"]},
+            "violationId": "V1",
+        }
+
+        rows = cdp_account_health.rows_from_violation(violation, category, "Soebiz", "美国")
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["store"], "Soebiz")
+        self.assertEqual(rows[0]["asin"], "B0H4QD9255")
+        self.assertEqual(rows[0]["sku"], "3314-BN-BASIC2")
+        self.assertEqual(rows[0]["category"], "食品和商品安全问题")
+        self.assertIn("Bathroom Faucet", rows[0]["impacted_text"])
+
+    def test_execute_cdp_collect_current_writes_artifacts_from_mocked_collection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                port=9222,
+                port_start=0,
+                port_end=0,
+                url_contains="",
+                text_limit=0,
+                start_date="2026-06-01",
+                end_date="2026-06-25",
+                categories="safe",
+                page_size=25,
+                max_pages=2,
+                store="",
+                site="",
+                output_dir="",
+                include_items=True,
+            )
+            collection = {
+                "ok": True,
+                "store": "Soebiz",
+                "site": "美国",
+                "target": {"url": "https://sellercentral.amazon.com/performance/account/health/product-policies"},
+                "page_reports": [{"category": "safe", "page": 1, "violations": 1}],
+                "rows": [
+                    {
+                        "store": "Soebiz",
+                        "site": "美国",
+                        "category": "食品和商品安全问题",
+                        "asin": "B0H4QD9255",
+                        "sku": "3314-BN-BASIC2",
+                        "reason": "安全饮用水法案",
+                        "date": "2026年6月10日",
+                        "impacted_text": "Bathroom Faucet\nASIN: B0H4QD9255\nSKU: 3314-BN-BASIC2",
+                        "sales_risk": "过去 12 个月无销量",
+                        "action": "商品已移除",
+                        "rating_impact": "无影响",
+                    }
+                ],
+            }
+            with mock.patch.object(cdp_account_health, "collect_current_account_health", return_value=collection):
+                result = notifier.execute_cdp_collect_current(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["row_count"], 1)
+            self.assertTrue(Path(result["artifact"]).is_file())
+            self.assertTrue(Path(result["json_artifact"]).is_file())
+            self.assertEqual(result["items"][0]["ASIN"], "B0H4QD9255")
 
 
 class ExcelEndToEndTests(unittest.TestCase):

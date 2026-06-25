@@ -20,6 +20,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import html
 import xml.etree.ElementTree as ET
 
+import cdp_account_health
 import ziniao_cdp
 
 
@@ -221,6 +222,8 @@ def default_config() -> dict[str, Any]:
             "port_end": 9250,
             "url_contains": "sellercentral.amazon.com",
             "text_limit": 800,
+            "collect_page_size": 25,
+            "collect_max_pages": 20,
             "watch_duration_seconds": 30,
             "watch_interval_seconds": 2,
             "reconnect_timeout_seconds": 60,
@@ -1610,6 +1613,95 @@ def execute_cdp_lifecycle_test(args: argparse.Namespace) -> dict[str, Any]:
     return ziniao_cdp.lifecycle_payload(build_cdp_args(config, args))
 
 
+def impact_item_from_cdp_row(row: dict[str, Any], source_file: str) -> ImpactItem:
+    return ImpactItem(
+        store=clean_text(row.get("store")),
+        site=clean_text(row.get("site")) or SITE_US,
+        category=clean_text(row.get("category")),
+        asin=clean_text(row.get("asin")),
+        sku=clean_text(row.get("sku")),
+        reason=clean_text(row.get("reason")),
+        date=clean_text(row.get("date")),
+        impacted_text=clean_text(row.get("impacted_text")),
+        sales_risk=clean_text(row.get("sales_risk")),
+        action=clean_text(row.get("action")),
+        rating_impact=clean_text(row.get("rating_impact")),
+        source_file=source_file,
+    )
+
+
+def execute_cdp_collect_current(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    cdp_args = build_cdp_args(config, args)
+    start_date = clean_text(args.start_date)
+    end_date = clean_text(args.end_date)
+    if not start_date or not end_date:
+        start_date, end_date = cdp_account_health.current_month_range()
+    cdp_config = config.get("ziniao_cdp", {})
+    page_size = int(args.page_size or cdp_config.get("collect_page_size") or cdp_account_health.DEFAULT_PAGE_SIZE)
+    max_pages = int(args.max_pages or cdp_config.get("collect_max_pages") or cdp_account_health.DEFAULT_MAX_PAGES)
+    categories = cdp_account_health.selected_categories(args.categories)
+    collection = cdp_account_health.collect_current_account_health(
+        cdp_args,
+        start_date=start_date,
+        end_date=end_date,
+        categories=categories,
+        page_size=page_size,
+        max_pages=max_pages,
+        store_override=args.store,
+        site_override=args.site,
+    )
+    run_id = run_id_text()
+    source_file = f"cdp:{collection.get('target', {}).get('url', '')}"
+    items = [impact_item_from_cdp_row(row, source_file) for row in collection.get("rows", [])]
+    item_rows = [item.to_row(run_id, "cdp_collected") for item in items]
+    summary = summarize_items(items, expected_stores=[])
+    summary["target_site"] = collection.get("site") or args.site or SITE_US
+    result_dir = Path(args.output_dir or config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
+    artifact = result_dir / f"account-health-cdp-current-{run_id}.xlsx"
+    write_parse_xlsx(artifact, item_rows, summary)
+    json_artifact = result_dir / f"account-health-cdp-current-{run_id}.json"
+    json_artifact.parent.mkdir(parents=True, exist_ok=True)
+    json_artifact.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "store": collection.get("store"),
+                "site": collection.get("site"),
+                "row_count": len(items),
+                "page_reports": collection.get("page_reports", []),
+                "rows": collection.get("rows", []),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = {
+        "ok": True,
+        "status": "success",
+        "run_id": run_id,
+        "store": collection.get("store"),
+        "site": collection.get("site"),
+        "start_date": start_date,
+        "end_date": end_date,
+        "row_count": len(items),
+        "artifact": str(artifact),
+        "json_artifact": str(json_artifact),
+        "page_reports": collection.get("page_reports", []),
+        **summary,
+    }
+    if args.include_items:
+        payload["items"] = [item.to_row(run_id, "cdp_collected") for item in items]
+    else:
+        payload["items_preview"] = [item.to_row(run_id, "cdp_collected") for item in items[:20]]
+    return payload
+
+
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path)
@@ -1909,6 +2001,24 @@ def build_parser() -> argparse.ArgumentParser:
     cdp_lifecycle.add_argument("--disconnect-wait-seconds", type=float, default=0, help="关闭后等待断开秒数")
     cdp_lifecycle.add_argument("--reconnect-timeout-seconds", type=float, default=0, help="重连等待上限")
     cdp_lifecycle.set_defaults(func=execute_cdp_lifecycle_test)
+
+    cdp_collect = sub.add_parser("cdp-collect-current", help="Collect current-month account health issues through Ziniao CDP")
+    add_common(cdp_collect)
+    cdp_collect.add_argument("--port", type=int, default=0, help="CDP port")
+    cdp_collect.add_argument("--port-start", type=int, default=0, help="CDP scan start port")
+    cdp_collect.add_argument("--port-end", type=int, default=0, help="CDP scan end port")
+    cdp_collect.add_argument("--url-contains", default="", help="target page URL fragment")
+    cdp_collect.add_argument("--text-limit", type=int, default=0, help="page text limit")
+    cdp_collect.add_argument("--start-date", default="", help="start date YYYY-MM-DD, defaults to current month start")
+    cdp_collect.add_argument("--end-date", default="", help="end date YYYY-MM-DD, defaults to today")
+    cdp_collect.add_argument("--categories", default="all", help="all or comma-separated policy keys")
+    cdp_collect.add_argument("--page-size", type=int, default=0, help="API page size")
+    cdp_collect.add_argument("--max-pages", type=int, default=0, help="maximum pages per category")
+    cdp_collect.add_argument("--store", default="", help="override store name")
+    cdp_collect.add_argument("--site", default="", help="override site")
+    cdp_collect.add_argument("--output-dir", default="", help="output directory")
+    cdp_collect.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
+    cdp_collect.set_defaults(func=execute_cdp_collect_current)
 
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)

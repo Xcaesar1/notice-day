@@ -13,6 +13,8 @@
     "port_end": 9250,
     "url_contains": "sellercentral.amazon.com",
     "text_limit": 800,
+    "collect_page_size": 25,
+    "collect_max_pages": 20,
     "watch_duration_seconds": 30,
     "watch_interval_seconds": 2,
     "reconnect_timeout_seconds": 60,

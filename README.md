@@ -59,6 +59,11 @@ python account_health_notifier.py cdp-doctor --json
 python account_health_notifier.py cdp-watch --duration-seconds 20 --interval-seconds 2 --json
 python account_health_notifier.py cdp-lifecycle-test --json
 
+# CDP single-store account-health collection from the current Ziniao Seller Central window.
+# Default date range is current month, e.g. 2026-06-01 to 2026-06-25 on 2026-06-25.
+python account_health_notifier.py cdp-collect-current --json --port 9222
+python account_health_notifier.py cdp-collect-current --json --port 9222 --categories safe --start-date 2026-06-01 --end-date 2026-06-25
+
 # 安装紫鸟 CDP daemon 登录自启, 先 dry-run 查看 schtasks 命令
 python account_health_notifier.py install-cdp-daemon --dry-run --json
 python account_health_notifier.py install-cdp-daemon --json
