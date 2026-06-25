@@ -166,6 +166,64 @@ class ZiniaoCdpTests(unittest.TestCase):
         self.assertEqual(passed.port, 9333)
         self.assertEqual(passed.url_contains, "sellercentral.amazon.com")
 
+    def test_classifies_websocket_and_context_failures(self) -> None:
+        self.assertEqual(ziniao_cdp.classify_error("WS_CLOSED: closed"), ziniao_cdp.STATUS_WS_CLOSED)
+        self.assertEqual(
+            ziniao_cdp.classify_error("Execution context was destroyed"),
+            ziniao_cdp.STATUS_CONTEXT_LOST,
+        )
+
+    def test_cdp_doctor_uses_runtime_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["ziniao_cdp"]["port_start"] = 9330
+            config["ziniao_cdp"]["port_end"] = 9340
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                port=0,
+                port_start=0,
+                port_end=0,
+                url_contains="",
+                text_limit=0,
+                include_body_sample=False,
+            )
+            with mock.patch.object(ziniao_cdp, "doctor_payload", return_value={"ok": True}) as mocked:
+                result = notifier.execute_cdp_doctor(args)
+
+        self.assertTrue(result["ok"])
+        passed = mocked.call_args.args[0]
+        self.assertEqual(passed.port_start, 9330)
+        self.assertEqual(passed.port_end, 9340)
+
+    def test_install_cdp_daemon_dry_run_builds_onlogon_task(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["ziniao_cdp"]["daemon_task_name"] = "Test-ZiniaoCdpDaemon"
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                dry_run=True,
+                task_name="",
+                python=sys.executable,
+                log_file="",
+                port_start=0,
+                port_end=0,
+            )
+
+            result = notifier.execute_install_cdp_daemon(args)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "dry_run")
+        self.assertIn("ONLOGON", result["command"])
+        self.assertIn("Test-ZiniaoCdpDaemon", result["command"])
+
 
 class ExcelEndToEndTests(unittest.TestCase):
     def test_parse_generated_excel_filters_site_dedupes_and_writes_summary(self) -> None:

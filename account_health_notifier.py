@@ -31,6 +31,7 @@ DEFAULT_DWS_CALL = Path(r"Q:\Dingcli\dws-call.cmd")
 DEFAULT_SOURCE_DIR = Path(r"C:\Users\god\Desktop\RPA下载结果\账户状况异常明细")
 DEFAULT_STORE_LIST = Path(r"F:\店铺清单.xlsx")
 DEFAULT_TASK_NAME = "YD-AmazonAccountHealth-DingTalkNotifier"
+DEFAULT_CDP_DAEMON_TASK_NAME = "YD-ZiniaoCdpDaemon"
 
 SITE_US = "美国"
 SHEET_DETAIL_NAMES = {"异常明细", "寮傚父鏄庣粏"}
@@ -220,6 +221,11 @@ def default_config() -> dict[str, Any]:
             "port_end": 9250,
             "url_contains": "sellercentral.amazon.com",
             "text_limit": 800,
+            "watch_duration_seconds": 30,
+            "watch_interval_seconds": 2,
+            "reconnect_timeout_seconds": 60,
+            "daemon_task_name": DEFAULT_CDP_DAEMON_TASK_NAME,
+            "daemon_log_path": str(DEFAULT_STATE_DIR / "ziniao-cdp-daemon.log"),
         },
         "dingtalk": {
             "dws_call": str(DEFAULT_DWS_CALL),
@@ -1548,20 +1554,60 @@ def execute_validate_config(args: argparse.Namespace) -> dict[str, Any]:
 def execute_cdp_smoke(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path) if config_path.is_file() else default_config()
+    probe_args = build_cdp_args(config, args)
+    return ziniao_cdp.probe_payload(probe_args)
+
+
+def build_cdp_args(config: dict[str, Any], args: argparse.Namespace) -> argparse.Namespace:
     cdp_config = config.get("ziniao_cdp", {})
     port = int(args.port or cdp_config.get("port") or 0)
     port_start = int(args.port_start or cdp_config.get("port_start") or ziniao_cdp.DEFAULT_PORT_START)
     port_end = int(args.port_end or cdp_config.get("port_end") or ziniao_cdp.DEFAULT_PORT_END)
     url_contains = args.url_contains or cdp_config.get("url_contains") or ziniao_cdp.DEFAULT_URL_CONTAINS
     text_limit = int(args.text_limit or cdp_config.get("text_limit") or 800)
-    probe_args = argparse.Namespace(
+    duration_seconds = float(
+        getattr(args, "duration_seconds", 0) or cdp_config.get("watch_duration_seconds") or ziniao_cdp.DEFAULT_WATCH_DURATION_SECONDS
+    )
+    interval_seconds = float(
+        getattr(args, "interval_seconds", 0) or cdp_config.get("watch_interval_seconds") or ziniao_cdp.DEFAULT_WATCH_INTERVAL_SECONDS
+    )
+    reconnect_timeout_seconds = float(
+        getattr(args, "reconnect_timeout_seconds", 0)
+        or cdp_config.get("reconnect_timeout_seconds")
+        or ziniao_cdp.DEFAULT_RECONNECT_TIMEOUT_SECONDS
+    )
+    return argparse.Namespace(
         port=port,
         port_start=port_start,
         port_end=port_end,
         url_contains=url_contains,
         text_limit=text_limit,
+        include_body_sample=bool(getattr(args, "include_body_sample", False)),
+        duration_seconds=duration_seconds,
+        interval_seconds=interval_seconds,
+        reconnect_timeout_seconds=reconnect_timeout_seconds,
+        close_target=bool(getattr(args, "close_target", False)),
+        wait_reopen=bool(getattr(args, "wait_reopen", False)),
+        disconnect_wait_seconds=float(getattr(args, "disconnect_wait_seconds", 0) or 3),
     )
-    return ziniao_cdp.probe_payload(probe_args)
+
+
+def execute_cdp_doctor(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    return ziniao_cdp.doctor_payload(build_cdp_args(config, args))
+
+
+def execute_cdp_watch(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    return ziniao_cdp.watch_payload(build_cdp_args(config, args))
+
+
+def execute_cdp_lifecycle_test(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    return ziniao_cdp.lifecycle_payload(build_cdp_args(config, args))
 
 
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
@@ -1638,6 +1684,47 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
     result = subprocess.run(schtasks_args, text=True, encoding="utf-8", errors="replace", capture_output=True)
     return {
         "ok": result.returncode == 0,
+        "dry_run": False,
+        "exit_code": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "command": schtasks_args,
+    }
+
+
+def execute_install_cdp_daemon(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    cdp_config = config.get("ziniao_cdp", {})
+    task_name = args.task_name or cdp_config.get("daemon_task_name") or DEFAULT_CDP_DAEMON_TASK_NAME
+    python_exe = Path(args.python or sys.executable).resolve()
+    daemon_script = Path(__file__).resolve().parent / "tools" / "ziniao_cdp_daemon.py"
+    log_path = Path(args.log_file or cdp_config.get("daemon_log_path") or DEFAULT_STATE_DIR / "ziniao-cdp-daemon.log")
+    port_start = int(args.port_start or cdp_config.get("port_start") or ziniao_cdp.DEFAULT_PORT_START)
+    port_end = int(args.port_end or cdp_config.get("port_end") or ziniao_cdp.DEFAULT_PORT_END)
+    if not daemon_script.is_file():
+        return {"ok": False, "status": "preflight_failed", "issues": [issue("daemon_missing", str(daemon_script))]}
+    command = (
+        f'"{python_exe}" "{daemon_script}" '
+        f'--port-start {port_start} --port-end {port_end} --log-file "{log_path}"'
+    )
+    schtasks_args = [
+        "schtasks",
+        "/Create",
+        "/TN",
+        task_name,
+        "/SC",
+        "ONLOGON",
+        "/TR",
+        command,
+        "/F",
+    ]
+    if args.dry_run:
+        return {"ok": True, "status": "dry_run", "dry_run": True, "command": schtasks_args}
+    result = subprocess.run(schtasks_args, text=True, encoding="utf-8", errors="replace", capture_output=True)
+    return {
+        "ok": result.returncode == 0,
+        "status": "installed" if result.returncode == 0 else "install_failed",
         "dry_run": False,
         "exit_code": result.returncode,
         "stdout": result.stdout,
@@ -1789,6 +1876,40 @@ def build_parser() -> argparse.ArgumentParser:
     cdp_smoke.add_argument("--text-limit", type=int, default=0, help="页面正文摘要长度")
     cdp_smoke.set_defaults(func=execute_cdp_smoke)
 
+    cdp_doctor = sub.add_parser("cdp-doctor", help="诊断紫鸟 CDP、daemon、端口、target 和页面可读性")
+    add_common(cdp_doctor)
+    cdp_doctor.add_argument("--port", type=int, default=0, help="指定 CDP 端口, 不指定则扫描")
+    cdp_doctor.add_argument("--port-start", type=int, default=0, help="扫描起始端口")
+    cdp_doctor.add_argument("--port-end", type=int, default=0, help="扫描结束端口")
+    cdp_doctor.add_argument("--url-contains", default="", help="目标页面 URL 片段")
+    cdp_doctor.add_argument("--text-limit", type=int, default=0, help="页面正文摘要长度")
+    cdp_doctor.add_argument("--include-body-sample", action="store_true", help="输出页面正文摘要")
+    cdp_doctor.set_defaults(func=execute_cdp_doctor)
+
+    cdp_watch = sub.add_parser("cdp-watch", help="连续检查 CDP 心跳并记录断开/重连状态")
+    add_common(cdp_watch)
+    cdp_watch.add_argument("--port", type=int, default=0, help="指定 CDP 端口, 不指定则扫描")
+    cdp_watch.add_argument("--port-start", type=int, default=0, help="扫描起始端口")
+    cdp_watch.add_argument("--port-end", type=int, default=0, help="扫描结束端口")
+    cdp_watch.add_argument("--url-contains", default="", help="目标页面 URL 片段")
+    cdp_watch.add_argument("--text-limit", type=int, default=0, help="页面正文摘要长度")
+    cdp_watch.add_argument("--duration-seconds", type=float, default=0, help="观察时长")
+    cdp_watch.add_argument("--interval-seconds", type=float, default=0, help="心跳间隔")
+    cdp_watch.set_defaults(func=execute_cdp_watch)
+
+    cdp_lifecycle = sub.add_parser("cdp-lifecycle-test", help="验证当前 target 可读、断开和重连边界")
+    add_common(cdp_lifecycle)
+    cdp_lifecycle.add_argument("--port", type=int, default=0, help="指定 CDP 端口, 不指定则扫描")
+    cdp_lifecycle.add_argument("--port-start", type=int, default=0, help="扫描起始端口")
+    cdp_lifecycle.add_argument("--port-end", type=int, default=0, help="扫描结束端口")
+    cdp_lifecycle.add_argument("--url-contains", default="", help="目标页面 URL 片段")
+    cdp_lifecycle.add_argument("--text-limit", type=int, default=0, help="页面正文摘要长度")
+    cdp_lifecycle.add_argument("--close-target", action="store_true", help="关闭当前 Seller Central target")
+    cdp_lifecycle.add_argument("--wait-reopen", action="store_true", help="关闭后等待重开窗口并重连")
+    cdp_lifecycle.add_argument("--disconnect-wait-seconds", type=float, default=0, help="关闭后等待断开秒数")
+    cdp_lifecycle.add_argument("--reconnect-timeout-seconds", type=float, default=0, help="重连等待上限")
+    cdp_lifecycle.set_defaults(func=execute_cdp_lifecycle_test)
+
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)
     send_test.add_argument("--send", action="store_true", help="真实发送测试消息")
@@ -1802,6 +1923,16 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("--python", default="", help="Python 可执行文件")
     schedule.add_argument("--skip-preflight", action="store_true", help="跳过配置预检, 仅用于排障")
     schedule.set_defaults(func=execute_install_schedule)
+
+    cdp_daemon = sub.add_parser("install-cdp-daemon", help="安装紫鸟 CDP daemon 开机登录自启任务")
+    add_common(cdp_daemon)
+    cdp_daemon.add_argument("--dry-run", action="store_true", help="只显示 schtasks 命令")
+    cdp_daemon.add_argument("--task-name", default="", help="任务计划名称")
+    cdp_daemon.add_argument("--python", default="", help="Python 可执行文件")
+    cdp_daemon.add_argument("--log-file", default="", help="daemon 日志路径")
+    cdp_daemon.add_argument("--port-start", type=int, default=0, help="扫描起始端口")
+    cdp_daemon.add_argument("--port-end", type=int, default=0, help="扫描结束端口")
+    cdp_daemon.set_defaults(func=execute_install_cdp_daemon)
 
     self_test = sub.add_parser("self-test", help="运行本地去重和 dry-run 自测")
     add_common(self_test)

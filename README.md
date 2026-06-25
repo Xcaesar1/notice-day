@@ -54,6 +54,15 @@ python account_health_notifier.py validate-config --require-send-ready --json
 python account_health_notifier.py cdp-smoke --json
 python ziniao_cdp.py probe --json --port 9222
 
+# CDP 能力边界诊断和心跳观察
+python account_health_notifier.py cdp-doctor --json
+python account_health_notifier.py cdp-watch --duration-seconds 20 --interval-seconds 2 --json
+python account_health_notifier.py cdp-lifecycle-test --json
+
+# 安装紫鸟 CDP daemon 登录自启, 先 dry-run 查看 schtasks 命令
+python account_health_notifier.py install-cdp-daemon --dry-run --json
+python account_health_notifier.py install-cdp-daemon --json
+
 # sample 自测不代表全店铺覆盖, 需要显式跳过覆盖校验
 python account_health_notifier.py run --source-type sample --dry-run --skip-store-coverage --json
 
@@ -81,6 +90,8 @@ python account_health_notifier.py install-schedule --json
 
 - CDP 能读取浏览器页面和登录态上下文, 排障命令默认不读取 Cookie/token, 日志和提交中也不能写入 Cookie/token。
 - 紫鸟 CDP 守护进程必须先于店铺浏览器启动; 已打开且未带 `--remote-debugging-port` 的旧窗口需要关闭后重开。
+- `cdp-lifecycle-test` 默认不关闭窗口; 只有显式加 `--close-target` 才会关闭当前 Seller Central target。
+- daemon 日志只记录 PID, 端口, target 标题和 URL, 不记录 Cookie/token/localStorage/sessionStorage。
 - 脚本不创建群, 不添加机器人, 不修改群成员。
 - 缺少 `robot_code` 或 `group_open_conversation_id` 时不能真实发送。
 - `send_enabled=false` 时, `run` 默认 dry-run; 需要真实发送时使用 `--send` 或将配置改为 `true`。
