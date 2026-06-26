@@ -1228,7 +1228,7 @@ class ConfigValidationTests(unittest.TestCase):
         config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
         return config_path
 
-    def test_validate_config_requires_robot_group_and_send_enabled_for_send_ready(self) -> None:
+    def test_validate_config_requires_webhook_secret_and_send_enabled_for_send_ready(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_path = self._base_config_path(root)
@@ -1238,8 +1238,8 @@ class ConfigValidationTests(unittest.TestCase):
 
             codes = {issue["code"] for issue in result["issues"]}
             self.assertFalse(result["ok"])
-            self.assertIn("robot_code_missing", codes)
-            self.assertIn("group_open_conversation_id_missing", codes)
+            self.assertIn("webhook_url_missing", codes)
+            self.assertIn("webhook_secret_missing", codes)
             self.assertIn("send_enabled_false", codes)
 
     def test_validate_config_reports_missing_config_without_exception(self) -> None:
@@ -1300,15 +1300,17 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertTrue(result["dry_run"])
             self.assertEqual(result["status"], "preflight_failed")
             self.assertIn("command", result)
-            self.assertIn("robot_code_missing", {issue["code"] for issue in result["issues"]})
+            codes = {issue["code"] for issue in result["issues"]}
+            self.assertIn("webhook_url_missing", codes)
+            self.assertIn("webhook_secret_missing", codes)
 
     def test_install_schedule_reports_invalid_interval_without_exception(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_path = self._base_config_path(root)
             config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["dingtalk"]["robot_code"] = "robot"
-            config["dingtalk"]["group_open_conversation_id"] = "group"
+            config["dingtalk"]["webhook_url"] = "https://oapi.dingtalk.com/robot/send?access_token=test"
+            config["dingtalk"]["secret"] = "SECtest"
             config["dingtalk"]["send_enabled"] = True
             config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
             args = argparse.Namespace(
@@ -1327,7 +1329,7 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertEqual(result["status"], "preflight_failed")
             self.assertIn("interval_hours_invalid", {issue["code"] for issue in result["issues"]})
 
-    def test_send_test_send_requires_send_ready_config_without_calling_dws(self) -> None:
+    def test_send_test_send_requires_send_ready_config_without_calling_network(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_path = self._base_config_path(root)
@@ -1339,8 +1341,8 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "preflight_failed")
             self.assertFalse(result["dry_run"])
-            self.assertIn("robot_code_missing", codes)
-            self.assertIn("group_open_conversation_id_missing", codes)
+            self.assertIn("webhook_url_missing", codes)
+            self.assertIn("webhook_secret_missing", codes)
             self.assertIn("send_enabled_false", codes)
             self.assertFalse((root / "messages").exists())
 
@@ -1408,6 +1410,7 @@ class RuntimeFileSafetyTests(unittest.TestCase):
             dws_call = root / "dws.cmd"
             dws_call.write_text("@echo off\r\nexit /b 0\r\n", encoding="utf-8")
             config = notifier.default_config()
+            config["dingtalk"]["method"] = "dws"
             config["dingtalk"]["dws_call"] = str(dws_call)
             original_time = notifier.time.time
             try:
@@ -1421,6 +1424,57 @@ class RuntimeFileSafetyTests(unittest.TestCase):
             payloads = [path.read_text(encoding="utf-8") for path in message_files]
             self.assertEqual(len(message_files), 2)
             self.assertEqual(payloads, ["first message", "second message"])
+
+    def test_dingtalk_webhook_signature_has_timestamp_and_sign(self) -> None:
+        signed = notifier.build_dingtalk_signed_url(
+            "https://oapi.dingtalk.com/robot/send?access_token=test",
+            "SECtest",
+            timestamp_ms=1234567890,
+        )
+
+        self.assertIn("timestamp=1234567890", signed)
+        self.assertIn("sign=", signed)
+        self.assertNotIn("SECtest", signed)
+
+    def test_send_dingtalk_webhook_dry_run_does_not_create_message_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+
+            result = notifier.send_dingtalk_markdown(config, root, "title", "body", dry_run=True)
+
+            self.assertEqual(result.returncode, 0)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["method"], "webhook")
+            self.assertTrue(payload["dry_run"])
+            self.assertFalse((root / "messages").exists())
+
+    def test_send_dingtalk_webhook_success_response(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self) -> bytes:
+                return b'{"errcode":0,"errmsg":"ok"}'
+
+        with mock.patch.object(notifier.urlrequest, "urlopen", return_value=FakeResponse()) as patched:
+            result = notifier.send_dingtalk_webhook(
+                "https://oapi.dingtalk.com/robot/send?access_token=test",
+                "SECtest",
+                "title",
+                "body",
+                dry_run=False,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["errcode"], 0)
+        request = patched.call_args.args[0]
+        self.assertIn("timestamp=", request.full_url)
+        self.assertIn("sign=", request.full_url)
+        self.assertNotIn("SECtest", request.full_url)
 
     def test_self_test_can_run_twice_without_leaving_locked_state(self) -> None:
         root = notifier.DEFAULT_STATE_DIR / f"self-test-unit-{uuid.uuid4().hex}"
@@ -1442,6 +1496,7 @@ class SendFailureTests(unittest.TestCase):
     def _write_config(self, root: Path, dws_call: Path) -> Path:
         config = notifier.default_config()
         config["source"]["type"] = "sample"
+        config["dingtalk"]["method"] = "dws"
         config["dingtalk"]["dws_call"] = str(dws_call)
         config["dingtalk"]["robot_code"] = "robot"
         config["dingtalk"]["group_open_conversation_id"] = "group"
@@ -1518,6 +1573,7 @@ class SendSuccessTests(unittest.TestCase):
             dws_call.write_text("@echo off\r\necho {\"ok\":true}\r\nexit /b 0\r\n", encoding="utf-8")
             config = notifier.default_config()
             config["source"]["type"] = "sample"
+            config["dingtalk"]["method"] = "dws"
             config["dingtalk"]["dws_call"] = str(dws_call)
             config["dingtalk"]["robot_code"] = "robot"
             config["dingtalk"]["group_open_conversation_id"] = "group"

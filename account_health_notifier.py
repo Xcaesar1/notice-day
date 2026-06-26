@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -16,6 +18,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
 from zipfile import ZIP_DEFLATED, ZipFile
 import html
 import xml.etree.ElementTree as ET
@@ -245,6 +250,9 @@ def default_config() -> dict[str, Any]:
             "daemon_log_path": str(DEFAULT_STATE_DIR / "ziniao-cdp-daemon.log"),
         },
         "dingtalk": {
+            "method": "webhook",
+            "webhook_url": "",
+            "secret": "",
             "dws_call": str(DEFAULT_DWS_CALL),
             "robot_code": "",
             "group_open_conversation_id": "",
@@ -808,6 +816,97 @@ def run_dws_call(dws_call: Path, args: list[str], state_dir: Path, timeout: int 
     )
 
 
+def dingtalk_send_method(dingtalk: dict[str, Any]) -> str:
+    method = clean_text(dingtalk.get("method")).lower()
+    if method:
+        return method
+    if clean_text(dingtalk.get("webhook_url")):
+        return "webhook"
+    return "dws"
+
+
+def build_dingtalk_signed_url(webhook_url: str, secret: str, timestamp_ms: int | None = None) -> str:
+    timestamp = str(timestamp_ms if timestamp_ms is not None else round(time.time() * 1000))
+    string_to_sign = f"{timestamp}\n{secret}"
+    hmac_code = hmac.new(
+        secret.encode("utf-8"),
+        string_to_sign.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+    sign = urlparse.quote_plus(base64.b64encode(hmac_code))
+    separator = "&" if "?" in webhook_url else "?"
+    return f"{webhook_url}{separator}timestamp={timestamp}&sign={sign}"
+
+
+def send_dingtalk_webhook(
+    webhook_url: str,
+    secret: str,
+    title: str,
+    markdown: str,
+    dry_run: bool,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    if not webhook_url:
+        if not dry_run:
+            raise ValueError("缺少 dingtalk.webhook_url。")
+        webhook_url = "https://oapi.dingtalk.com/robot/send?access_token=DRY_RUN"
+    if not secret:
+        if not dry_run:
+            raise ValueError("缺少 dingtalk.secret。")
+        secret = "DRY_RUN_SECRET"
+
+    if dry_run:
+        stdout = json.dumps(
+            {
+                "ok": True,
+                "dry_run": True,
+                "method": "webhook",
+                "title": title,
+                "markdown_chars": len(markdown),
+            },
+            ensure_ascii=False,
+        )
+        return subprocess.CompletedProcess(["dingtalk-webhook", "--dry-run"], 0, stdout, "")
+
+    payload = {
+        "msgtype": "markdown",
+        "markdown": {
+            "title": title,
+            "text": markdown,
+        },
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    request = urlrequest.Request(
+        build_dingtalk_signed_url(webhook_url, secret),
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(request, timeout=timeout) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        response_text = exc.read().decode("utf-8", errors="replace")
+        return subprocess.CompletedProcess(["dingtalk-webhook", "--send"], 1, response_text, f"HTTP {exc.code}")
+    except Exception as exc:
+        return subprocess.CompletedProcess(["dingtalk-webhook", "--send"], 1, "", str(exc))
+
+    try:
+        response_payload = json.loads(response_text)
+    except json.JSONDecodeError:
+        return subprocess.CompletedProcess(["dingtalk-webhook", "--send"], 1, response_text, "invalid_json_response")
+
+    errcode = response_payload.get("errcode")
+    if errcode == 0:
+        return subprocess.CompletedProcess(["dingtalk-webhook", "--send"], 0, response_text, "")
+    return subprocess.CompletedProcess(
+        ["dingtalk-webhook", "--send"],
+        1,
+        response_text,
+        clean_text(response_payload.get("errmsg")) or f"errcode={errcode}",
+    )
+
+
 def send_dingtalk_markdown(
     config: dict[str, Any],
     state_dir: Path,
@@ -816,6 +915,18 @@ def send_dingtalk_markdown(
     dry_run: bool,
 ) -> subprocess.CompletedProcess[str]:
     dingtalk = config.get("dingtalk", {})
+    method = dingtalk_send_method(dingtalk)
+    if method == "webhook":
+        return send_dingtalk_webhook(
+            clean_text(dingtalk.get("webhook_url")),
+            clean_text(dingtalk.get("secret")),
+            title,
+            markdown,
+            dry_run=dry_run,
+        )
+    if method != "dws":
+        raise ValueError(f"不支持的 dingtalk.method: {method}")
+
     robot_code = clean_text(dingtalk.get("robot_code"))
     group_id = clean_text(dingtalk.get("group_open_conversation_id"))
     if not robot_code or not group_id:
@@ -1074,9 +1185,13 @@ def validate_runtime_config(
                 issues.append(issue("store_list_invalid", f"店铺清单读取失败: {exc}"))
 
     dingtalk = config.get("dingtalk", {})
-    dws_call = Path(dingtalk.get("dws_call") or DEFAULT_DWS_CALL)
-    if not dws_call.is_file():
-        issues.append(issue("dws_call_missing", f"DWS 调用入口不存在: {dws_call}"))
+    method = dingtalk_send_method(dingtalk)
+    if method == "dws":
+        dws_call = Path(dingtalk.get("dws_call") or DEFAULT_DWS_CALL)
+        if not dws_call.is_file():
+            issues.append(issue("dws_call_missing", f"DWS 调用入口不存在: {dws_call}"))
+    elif method != "webhook":
+        issues.append(issue("dingtalk_method_invalid", "dingtalk.method 必须是 webhook 或 dws"))
 
     notify = config.get("notify", {})
     try:
@@ -1106,10 +1221,16 @@ def validate_runtime_config(
     result_dir = Path(config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
 
     if require_send_ready:
-        if not clean_text(dingtalk.get("robot_code")):
-            issues.append(issue("robot_code_missing", "缺少 dingtalk.robot_code"))
-        if not clean_text(dingtalk.get("group_open_conversation_id")):
-            issues.append(issue("group_open_conversation_id_missing", "缺少 dingtalk.group_open_conversation_id"))
+        if method == "webhook":
+            if not clean_text(dingtalk.get("webhook_url")):
+                issues.append(issue("webhook_url_missing", "缺少 dingtalk.webhook_url"))
+            if not clean_text(dingtalk.get("secret")):
+                issues.append(issue("webhook_secret_missing", "缺少 dingtalk.secret"))
+        elif method == "dws":
+            if not clean_text(dingtalk.get("robot_code")):
+                issues.append(issue("robot_code_missing", "缺少 dingtalk.robot_code"))
+            if not clean_text(dingtalk.get("group_open_conversation_id")):
+                issues.append(issue("group_open_conversation_id_missing", "缺少 dingtalk.group_open_conversation_id"))
         if not bool(dingtalk.get("send_enabled", False)):
             issues.append(issue("send_enabled_false", "定时真实通知需要 dingtalk.send_enabled=true"))
 
@@ -1632,18 +1753,23 @@ def execute_doctor(args: argparse.Namespace) -> dict[str, Any]:
     config_exists = config_path.is_file()
     config = load_config(config_path) if config_exists else default_config()
     state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
-    dws_call = Path(config.get("dingtalk", {}).get("dws_call") or DEFAULT_DWS_CALL)
+    dingtalk = config.get("dingtalk", {})
+    method = dingtalk_send_method(dingtalk)
+    dws_call = Path(dingtalk.get("dws_call") or DEFAULT_DWS_CALL)
     db_path = Path(config.get("state", {}).get("db_path") or state_dir / "state.sqlite")
     checks = {
         "config_exists": config_exists,
         "config_path": str(config_path),
         "db_path": str(db_path),
+        "dingtalk_method": method,
+        "webhook_configured": bool(clean_text(dingtalk.get("webhook_url"))),
+        "webhook_secret_configured": bool(clean_text(dingtalk.get("secret"))),
         "dws_call_exists": dws_call.is_file(),
-        "robot_configured": bool(clean_text(config.get("dingtalk", {}).get("robot_code"))),
-        "group_configured": bool(clean_text(config.get("dingtalk", {}).get("group_open_conversation_id"))),
+        "robot_configured": bool(clean_text(dingtalk.get("robot_code"))),
+        "group_configured": bool(clean_text(dingtalk.get("group_open_conversation_id"))),
     }
     dws_status: dict[str, Any] = {}
-    if dws_call.is_file():
+    if method == "dws" and dws_call.is_file():
         try:
             result = run_dws_call(dws_call, ["auth", "status", "-f", "json"], state_dir, timeout=60)
             dws_status = {
@@ -1654,7 +1780,7 @@ def execute_doctor(args: argparse.Namespace) -> dict[str, Any]:
         except Exception as exc:
             dws_status = {"error": str(exc)}
     validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=False)
-    ok = checks["dws_call_exists"] and validation["ok"]
+    ok = validation["ok"]
     return {"ok": ok, "checks": checks, "validation": validation, "dws_auth_status": dws_status}
 
 
@@ -2045,7 +2171,7 @@ def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
                 "issues": validation["issues"],
             }
     title = f"{config.get('dingtalk', {}).get('title_prefix', '亚马逊账号状况异常')}测试消息"
-    markdown = "### 亚马逊账号状况异常测试消息\n\n- 这是一条 DWS 应用机器人连通性测试。\n- 如果你看到这条消息, 说明机器人发群链路可用。\n"
+    markdown = "### 亚马逊账号状况异常测试消息\n\n- 这是一条钉钉机器人连通性测试。\n- 如果你看到这条消息, 说明机器人发群链路可用。\n"
     result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
     return {
         "ok": result.returncode == 0,

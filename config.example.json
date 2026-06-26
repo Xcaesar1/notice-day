@@ -22,6 +22,9 @@
     "daemon_log_path": ".local-state\\account-health-notifier\\ziniao-cdp-daemon.log"
   },
   "dingtalk": {
+    "method": "webhook",
+    "webhook_url": "",
+    "secret": "",
     "dws_call": "Q:\\Dingcli\\dws-call.cmd",
     "robot_code": "",
     "group_open_conversation_id": "",
