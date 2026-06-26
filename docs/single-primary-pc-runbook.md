@@ -15,7 +15,7 @@
 
 ```powershell
 Set-Location Q:\notice-day
-python account_health_notifier.py run --send --json
+python account_health_notifier.py production-run --send --json
 ```
 
 正式运行前必须通过:
@@ -102,7 +102,7 @@ python account_health_notifier.py init-config --config .local-state\account-heal
 8. 在 Office-PC 上做 dry-run 和真实测试:
 
 ```powershell
-python account_health_notifier.py run --dry-run --json
+python account_health_notifier.py production-run --dry-run --json
 python account_health_notifier.py send-test --send --json
 ```
 
@@ -117,4 +117,4 @@ python account_health_notifier.py send-test --send --json
 - 当前月无新增异常时不发群.
 - 有新增或变化时, 钉钉只收到最新异常.
 - 消息格式符合 `docs/dingtalk-markdown-template.md`.
-- 失败店铺写入本地结果, 不阻断后续店铺.
+- 失败店铺写入本地结果, 不阻断后续店铺采集; 但本轮不会发钉钉, 避免漏店铺时误报"无新增".

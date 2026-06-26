@@ -39,7 +39,8 @@
   },
   "schedule": {
     "task_name": "YD-AmazonAccountHealth-DingTalkNotifier",
-    "interval_hours": 6
+    "interval_hours": 6,
+    "command": "production-run"
   },
   "state": {
     "db_path": ".local-state\\account-health-notifier\\state.sqlite",

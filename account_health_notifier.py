@@ -269,6 +269,7 @@ def default_config() -> dict[str, Any]:
         "schedule": {
             "task_name": DEFAULT_TASK_NAME,
             "interval_hours": 6,
+            "command": "production-run",
         },
         "state": {
             "db_path": str(DEFAULT_DB_PATH),
@@ -1228,6 +1229,7 @@ def validate_runtime_config(
     config: dict[str, Any],
     state_dir: Path,
     require_send_ready: bool = False,
+    require_source_excel: bool = True,
 ) -> dict[str, Any]:
     issues: list[dict[str, str]] = []
     if not config_path.is_file():
@@ -1235,16 +1237,17 @@ def validate_runtime_config(
 
     source = config.get("source", {})
     source_type = source.get("type") or "excel_latest"
-    if source_type == "excel":
-        excel_path = Path(source.get("excel_path") or "")
-        if not excel_path.is_file():
-            issues.append(issue("source_excel_missing", f"指定 Excel 不存在: {excel_path}"))
-    elif source_type == "excel_latest":
-        excel_dir = Path(source.get("excel_dir") or "")
-        if not excel_dir.is_dir():
-            issues.append(issue("source_excel_dir_missing", f"结果目录不存在: {excel_dir}"))
-    elif source_type == "bridge":
-        issues.append(issue("bridge_not_implemented", "bridge 采集入口当前版本尚未接入"))
+    if require_source_excel:
+        if source_type == "excel":
+            excel_path = Path(source.get("excel_path") or "")
+            if not excel_path.is_file():
+                issues.append(issue("source_excel_missing", f"指定 Excel 不存在: {excel_path}"))
+        elif source_type == "excel_latest":
+            excel_dir = Path(source.get("excel_dir") or "")
+            if not excel_dir.is_dir():
+                issues.append(issue("source_excel_dir_missing", f"结果目录不存在: {excel_dir}"))
+        elif source_type == "bridge":
+            issues.append(issue("bridge_not_implemented", "bridge 采集入口当前版本尚未接入"))
 
     try:
         configured_max_excel_age_hours(config)
@@ -2350,6 +2353,93 @@ def execute_zclaw_collect_stores(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
+    collect_args = argparse.Namespace(
+        config=getattr(args, "config", str(DEFAULT_CONFIG_PATH)),
+        state_dir=getattr(args, "state_dir", ""),
+        start_date=getattr(args, "start_date", ""),
+        end_date=getattr(args, "end_date", ""),
+        categories=getattr(args, "categories", "all"),
+        stores=getattr(args, "stores", ""),
+        limit=int(getattr(args, "limit", 0) or 0),
+        site=getattr(args, "site", ""),
+        page_size=int(getattr(args, "page_size", 0) or 0),
+        max_pages=int(getattr(args, "max_pages", 0) or 0),
+        open_timeout=int(getattr(args, "open_timeout", 0) or 0),
+        nav_timeout=int(getattr(args, "nav_timeout", 0) or 0),
+        exec_timeout=int(getattr(args, "exec_timeout", 0) or 0),
+        keep_open=bool(getattr(args, "keep_open", False)),
+        output_dir=getattr(args, "output_dir", ""),
+        include_items=False,
+    )
+    collection = execute_zclaw_collect_stores(collect_args)
+    source_excel = clean_text(collection.get("artifact"))
+    if not collection.get("ok") or not source_excel:
+        return {
+            "ok": False,
+            "status": "collect_failed",
+            "collection_status": collection.get("status", "unknown"),
+            "notification_status": "skipped",
+            "collection_run_id": collection.get("run_id", ""),
+            "start_date": collection.get("start_date", ""),
+            "end_date": collection.get("end_date", ""),
+            "target_site": collection.get("target_site", ""),
+            "target_count": collection.get("target_count", 0),
+            "row_count": collection.get("row_count", 0),
+            "source_excel": source_excel,
+            "collect_artifact": source_excel,
+            "collect_json_artifact": collection.get("json_artifact", ""),
+            "notify_artifact": "",
+            "total_items": 0,
+            "notify_candidates": 0,
+            "sent_items": 0,
+            "error": collection.get("coverage_error") or collection.get("error") or "ZClaw collection did not cover all target stores.",
+            "collection": collection,
+        }
+
+    notify_args = argparse.Namespace(
+        config=getattr(args, "config", str(DEFAULT_CONFIG_PATH)),
+        state_dir=getattr(args, "state_dir", ""),
+        source_type="excel",
+        source_excel=source_excel,
+        source_dir="",
+        site=collection.get("target_site") or getattr(args, "site", "") or SITE_US,
+        store_list="",
+        require_all_stores=True,
+        skip_store_coverage=False,
+        dry_run=bool(getattr(args, "dry_run", False)),
+        send=bool(getattr(args, "send", False)),
+    )
+    notification = execute_run(notify_args)
+    notification_status = clean_text(notification.get("status")) or "unknown"
+    ok = bool(notification.get("ok"))
+    status = notification_status if ok else f"notify_{notification_status}"
+    return {
+        "ok": ok,
+        "status": status,
+        "collection_status": collection.get("status", "unknown"),
+        "notification_status": notification_status,
+        "collection_run_id": collection.get("run_id", ""),
+        "notification_run_id": notification.get("run_id", ""),
+        "start_date": collection.get("start_date", ""),
+        "end_date": collection.get("end_date", ""),
+        "target_site": collection.get("target_site", ""),
+        "target_count": collection.get("target_count", 0),
+        "row_count": collection.get("row_count", 0),
+        "source_excel": source_excel,
+        "collect_artifact": source_excel,
+        "collect_json_artifact": collection.get("json_artifact", ""),
+        "notify_artifact": notification.get("artifact", ""),
+        "total_items": notification.get("total_items", 0),
+        "notify_candidates": notification.get("notify_candidates", 0),
+        "sent_items": notification.get("sent_items", 0),
+        "error": notification.get("error", ""),
+        "coverage": notification.get("coverage", {}),
+        "collection": collection,
+        "notification": notification,
+    }
+
+
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path)
@@ -2382,6 +2472,14 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
     schedule = config.get("schedule", {})
     task_name = args.task_name or schedule.get("task_name") or DEFAULT_TASK_NAME
+    schedule_command = clean_text(getattr(args, "schedule_command", "") or schedule.get("command") or "production-run")
+    if schedule_command not in {"production-run", "run"}:
+        return {
+            "ok": False,
+            "status": "preflight_failed",
+            "dry_run": bool(args.dry_run),
+            "issues": [issue("schedule_command_invalid", "schedule.command 必须是 production-run 或 run")],
+        }
     interval_raw = args.interval_hours or schedule.get("interval_hours") or 6
     try:
         interval = int(interval_raw)
@@ -2396,7 +2494,7 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
         }
     python_exe = Path(args.python or sys.executable).resolve()
     script = Path(__file__).resolve()
-    command = f'"{python_exe}" "{script}" run --config "{config_path}"'
+    command = f'"{python_exe}" "{script}" {schedule_command} --config "{config_path}"'
     schtasks_args = [
         "schtasks",
         "/Create",
@@ -2410,7 +2508,13 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
         command,
         "/F",
     ]
-    validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=True)
+    validation = validate_runtime_config(
+        config_path,
+        config,
+        state_dir,
+        require_send_ready=True,
+        require_source_excel=schedule_command == "run",
+    )
     if not validation["ok"] and not getattr(args, "skip_preflight", False):
         return {
             "ok": False,
@@ -2706,6 +2810,25 @@ def build_parser() -> argparse.ArgumentParser:
     zclaw_collect.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
     zclaw_collect.set_defaults(func=execute_zclaw_collect_stores)
 
+    production_run = sub.add_parser("production-run", help="Collect all stores with ZClaw, dedupe, and send DingTalk")
+    add_common(production_run)
+    production_run.add_argument("--start-date", default="", help="start date YYYY-MM-DD, defaults to current month start")
+    production_run.add_argument("--end-date", default="", help="end date YYYY-MM-DD, defaults to today")
+    production_run.add_argument("--categories", default="all", help="all or comma-separated policy keys")
+    production_run.add_argument("--stores", default="", help="comma-separated store names or store IDs; defaults to all visible Amazon US stores")
+    production_run.add_argument("--limit", type=int, default=0, help="limit selected stores for smoke testing")
+    production_run.add_argument("--site", default="", help="target site")
+    production_run.add_argument("--page-size", type=int, default=0, help="API page size")
+    production_run.add_argument("--max-pages", type=int, default=0, help="maximum pages per category")
+    production_run.add_argument("--open-timeout", type=int, default=0, help="store open timeout seconds")
+    production_run.add_argument("--nav-timeout", type=int, default=0, help="page navigation timeout seconds")
+    production_run.add_argument("--exec-timeout", type=int, default=0, help="page script timeout seconds")
+    production_run.add_argument("--keep-open", action="store_true", help="do not close store windows after collection")
+    production_run.add_argument("--output-dir", default="", help="collection output directory")
+    production_run.add_argument("--dry-run", action="store_true", help="do not send DingTalk messages")
+    production_run.add_argument("--send", action="store_true", help="allow real DingTalk sending")
+    production_run.set_defaults(func=execute_production_run)
+
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)
     send_test.add_argument("--send", action="store_true", help="真实发送测试消息")
@@ -2717,6 +2840,7 @@ def build_parser() -> argparse.ArgumentParser:
     schedule.add_argument("--task-name", default="", help="任务计划名称")
     schedule.add_argument("--interval-hours", default="", help="执行间隔小时数")
     schedule.add_argument("--python", default="", help="Python 可执行文件")
+    schedule.add_argument("--schedule-command", choices=["production-run", "run"], default="", help="任务计划执行命令")
     schedule.add_argument("--skip-preflight", action="store_true", help="跳过配置预检, 仅用于排障")
     schedule.set_defaults(func=execute_install_schedule)
 

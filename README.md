@@ -12,6 +12,7 @@
 当前能力:
 
 - 通过紫鸟浏览器 CDP 直连能力检查 Seller Central 页面是否可读。
+- 通过紫鸟 ZClaw 串行打开美国站店铺并采集当月账号状况异常。
 - 从账号状况结果 Excel 读取未解决异常明细。
 - 提取受影响商品的 ASIN 和 SKU。
 - 用 SQLite 记录已通知项, 新增或核心内容变化才再次通知。
@@ -50,8 +51,11 @@ python account_health_notifier.py validate-config --require-send-ready --json
 # 本地自测: 验证去重、内容变化重新通知和 dry-run 链路
 python account_health_notifier.py self-test --json
 
-# 从最新 Excel dry-run, 不真实发钉钉
-python account_health_notifier.py run --dry-run --json
+# 生产链路 dry-run: ZClaw 全店铺采集 -> 覆盖校验 -> 去重 -> 钉钉 dry-run
+python account_health_notifier.py production-run --dry-run --json
+
+# 生产链路真实发送, 只允许在 Office-PC 执行
+python account_health_notifier.py production-run --send --json
 
 # 配置预检, 第二条会要求机器人和群配置满足真实定时通知
 python account_health_notifier.py validate-config --json
@@ -100,9 +104,9 @@ python account_health_notifier.py install-schedule --dry-run --json
 python account_health_notifier.py install-schedule --json
 ```
 
-启用真实定时通知前, 建议先运行 `parse --require-all-stores`: 只有 `coverage_ok=true` 时才代表本次结果覆盖店铺清单里的全部美国站店铺。
-正式 `run` 默认启用 `require_all_stores_before_send`; 如果店铺清单无法读取或美国站店铺缺失, 会返回 `coverage_failed` 并且不会进入钉钉发送。
-`install-schedule` 默认会执行 `--require-send-ready` 级别预检; 缺少 Webhook, Secret 或 `send_enabled=true` 时会返回 `preflight_failed`, 不会安装任务计划。
+启用真实定时通知前, 先运行 `production-run --dry-run`: 只有 `coverage.coverage_ok=true` 时才代表本次结果覆盖店铺清单里的全部美国站店铺。
+正式 `production-run` 会先完成 ZClaw 全店铺采集, 再强制执行店铺覆盖校验; 如果店铺清单无法读取或美国站店铺缺失, 会返回失败并且不会进入钉钉发送。
+`install-schedule` 默认安装 `production-run`; 它会执行 `--require-send-ready` 级别预检, 缺少 Webhook, Secret 或 `send_enabled=true` 时会返回 `preflight_failed`, 不会安装任务计划。
 只有 Office-PC 允许启用 `send_enabled=true` 和安装 6 小时任务计划. NotePC 保持开发验证用途, 避免重复推送.
 
 ## 安全边界

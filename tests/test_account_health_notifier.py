@@ -1404,6 +1404,106 @@ class RunCoverageGuardTests(unittest.TestCase):
             self.assertEqual(notified_count, 0)
 
 
+class ProductionRunTests(unittest.TestCase):
+    def _args(self, root: Path, dry_run: bool = True, send: bool = False) -> argparse.Namespace:
+        return argparse.Namespace(
+            config=str(root / "config.json"),
+            state_dir=str(root),
+            start_date="",
+            end_date="",
+            categories="safe,restricted",
+            stores="BYF,Hangoro",
+            limit=2,
+            site=notifier.SITE_US,
+            page_size=25,
+            max_pages=3,
+            open_timeout=11,
+            nav_timeout=12,
+            exec_timeout=13,
+            keep_open=False,
+            output_dir=str(root / "runs"),
+            dry_run=dry_run,
+            send=send,
+        )
+
+    def test_production_run_collects_then_notifies_from_generated_excel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            collection = {
+                "ok": True,
+                "status": "success",
+                "run_id": "collect-1",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-26",
+                "target_site": notifier.SITE_US,
+                "target_count": 14,
+                "row_count": 7,
+                "artifact": str(root / "runs" / "collected.xlsx"),
+                "json_artifact": str(root / "runs" / "collected.json"),
+            }
+            notification = {
+                "ok": True,
+                "status": "dry_run",
+                "run_id": "notify-1",
+                "artifact": str(root / "runs" / "notify.xlsx"),
+                "total_items": 7,
+                "notify_candidates": 7,
+                "sent_items": 0,
+                "coverage": {"coverage_ok": True},
+                "error": "",
+            }
+
+            with mock.patch.object(notifier, "execute_zclaw_collect_stores", return_value=collection) as collect_mock:
+                with mock.patch.object(notifier, "execute_run", return_value=notification) as run_mock:
+                    result = notifier.execute_production_run(self._args(root))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "dry_run")
+            self.assertEqual(result["collection_status"], "success")
+            self.assertEqual(result["notification_status"], "dry_run")
+            self.assertEqual(result["source_excel"], collection["artifact"])
+            collect_args = collect_mock.call_args.args[0]
+            self.assertEqual(collect_args.categories, "safe,restricted")
+            self.assertEqual(collect_args.stores, "BYF,Hangoro")
+            self.assertEqual(collect_args.limit, 2)
+            self.assertEqual(collect_args.output_dir, str(root / "runs"))
+            run_args = run_mock.call_args.args[0]
+            self.assertEqual(run_args.source_type, "excel")
+            self.assertEqual(run_args.source_excel, collection["artifact"])
+            self.assertTrue(run_args.require_all_stores)
+            self.assertFalse(run_args.skip_store_coverage)
+            self.assertTrue(run_args.dry_run)
+            self.assertFalse(run_args.send)
+
+    def test_production_run_blocks_notification_when_collection_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            collection = {
+                "ok": False,
+                "status": "partial_failed",
+                "run_id": "collect-1",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-26",
+                "target_site": notifier.SITE_US,
+                "target_count": 14,
+                "row_count": 7,
+                "artifact": str(root / "runs" / "partial.xlsx"),
+                "json_artifact": str(root / "runs" / "partial.json"),
+                "coverage_error": "missing stores: Hanallx",
+            }
+
+            with mock.patch.object(notifier, "execute_zclaw_collect_stores", return_value=collection):
+                with mock.patch.object(notifier, "execute_run") as run_mock:
+                    result = notifier.execute_production_run(self._args(root, dry_run=False, send=True))
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "collect_failed")
+            self.assertEqual(result["collection_status"], "partial_failed")
+            self.assertEqual(result["notification_status"], "skipped")
+            self.assertEqual(result["error"], "missing stores: Hanallx")
+            run_mock.assert_not_called()
+
+
 class ConfigValidationTests(unittest.TestCase):
     def _base_config_path(self, root: Path) -> Path:
         source_dir = root / "source"
@@ -1503,6 +1603,34 @@ class ConfigValidationTests(unittest.TestCase):
             codes = {issue["code"] for issue in result["issues"]}
             self.assertIn("webhook_url_missing", codes)
             self.assertIn("webhook_secret_missing", codes)
+
+    def test_install_schedule_production_run_does_not_require_excel_source_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["source"]["excel_dir"] = str(root / "missing-source-dir")
+            config["dingtalk"]["webhook_url"] = "https://oapi.dingtalk.com/robot/send?access_token=test"
+            config["dingtalk"]["secret"] = "SECtest"
+            config["dingtalk"]["send_enabled"] = True
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                dry_run=True,
+                task_name="",
+                interval_hours="",
+                python="",
+                schedule_command="",
+                skip_preflight=False,
+            )
+
+            result = notifier.execute_install_schedule(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "dry_run")
+            self.assertIn("production-run", " ".join(result["command"]))
+            self.assertNotIn("source_excel_dir_missing", {issue["code"] for issue in result["issues"]})
 
     def test_install_schedule_reports_invalid_interval_without_exception(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
