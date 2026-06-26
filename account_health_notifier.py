@@ -827,7 +827,7 @@ def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk
     lines = [
         f"### {title}",
         "",
-        "**先看结论**",
+        "**结论**",
         f"- 新增/变化: {len(items)} 条",
         f"- 涉及店铺: {len(store_counts)} 个, {store_summary}",
         f"- 问题类型: {category_summary}",
@@ -835,22 +835,25 @@ def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk
     ]
     if chunk_total > 1:
         lines.append(f"- 分段: {chunk_index}/{chunk_total}")
-    lines.extend(["", "**明细**"])
 
     for store, categories in _group_items(items).items():
         store_total = sum(len(group) for group in categories.values())
-        lines.extend(["", "---", "", f"#### 店铺: {store}", f"共 {store_total} 条"])
+        category_summary_line = ", ".join(f"{category}: {len(group)} 条" for category, group in categories.items())
+        store_summary_line = f"共 {store_total} 条"
+        if category_summary_line:
+            store_summary_line = f"{store_summary_line} {category_summary_line}"
+        lines.extend(["", "---", "", f"#### 店铺: {store}", store_summary_line])
         for category, group in categories.items():
-            lines.append(f"**{category}: {len(group)} 条**")
             for index, item in enumerate(group, start=1):
                 asin = item.asin or "未识别"
                 sku = item.sku or "未识别"
                 date_text = item.date or "未识别"
                 action_text = item.action or "待确认"
-                lines.append(
-                    f"{index}. 问题类型: {category} | ASIN: `{asin}` | 日期: {date_text} | 当前处理: {action_text}"
-                )
-                lines.append(f"   SKU: `{sku}`")
+                lines.append(f"{index}. 问题类型: {category}  ")
+                lines.append(f"   日期: {date_text}  ")
+                lines.append(f"   当前处理: {action_text}  ")
+                lines.append(f"   ASIN: **{asin}**  ")
+                lines.append(f"   SKU: **{sku}**")
             lines.append("")
     return "\n".join(lines).strip() + "\n"
 

@@ -817,13 +817,25 @@ class NotificationRenderingTests(unittest.TestCase):
     def test_render_markdown_groups_by_store_and_omits_repeated_noise(self) -> None:
         markdown = notifier.render_markdown(self._items(), "2026年6月26日亚马逊账号状况异常新增通知", 1, 1)
 
-        self.assertIn("**先看结论**", markdown)
+        self.assertIn("**结论**", markdown)
+        self.assertNotIn("**先看结论**", markdown)
+        self.assertNotIn("**明细**", markdown)
         self.assertIn("#### 店铺: Artiqua", markdown)
         self.assertIn("#### 店铺: Soebiz", markdown)
-        self.assertIn("共 2 条", markdown)
+        self.assertIn("共 2 条 违反受限商品政策: 2 条", markdown)
         self.assertIn("---", markdown)
-        self.assertIn("问题类型: 违反受限商品政策 | ASIN: `B0GDFJ9B4J`", markdown)
-        self.assertIn("SKU: `SK0042-B-00BN`", markdown)
+        self.assertIn(
+            "2. 问题类型: 违反受限商品政策  \n"
+            "   日期: 2026年6月17日  \n"
+            "   当前处理: 已发送警告  \n"
+            "   ASIN: **B0GDFJ9B4J**  \n"
+            "   SKU: **SK0042-B-00BN**",
+            markdown,
+        )
+        self.assertNotIn(" | 日期:", markdown)
+        self.assertNotIn(" | ASIN:", markdown)
+        self.assertNotIn("ASIN: `", markdown)
+        self.assertNotIn("SKU: `", markdown)
         self.assertNotIn("处理优先级", markdown)
         self.assertNotIn("过去 12 个月无销量", markdown)
         self.assertNotIn("评级影响", markdown)
