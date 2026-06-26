@@ -764,6 +764,71 @@ class RunIdTests(unittest.TestCase):
         self.assertNotEqual(first, second)
 
 
+class NotificationRenderingTests(unittest.TestCase):
+    def _items(self) -> list[notifier.ImpactItem]:
+        return [
+            notifier.ImpactItem(
+                store="Artiqua",
+                site=notifier.SITE_US,
+                category="违反受限商品政策",
+                asin="B0GDFJ9B4J",
+                sku="SK0042-B-00BN",
+                reason="3P Penalty Recovery violation",
+                date="2026年6月17日",
+                impacted_text="ASIN: B0GDFJ9B4J SKU: SK0042-B-00BN",
+                sales_risk="过去 12 个月无销量",
+                action="已发送警告",
+                rating_impact="无影响",
+            ),
+            notifier.ImpactItem(
+                store="Artiqua",
+                site=notifier.SITE_US,
+                category="违反受限商品政策",
+                asin="B0GCS7Z66M",
+                sku="SK3315-A-00BK",
+                reason="3P Penalty Recovery violation",
+                date="2026年6月16日",
+                impacted_text="ASIN: B0GCS7Z66M SKU: SK3315-A-00BK",
+                sales_risk="过去 12 个月无销量",
+                action="已发送警告",
+                rating_impact="无影响",
+            ),
+            notifier.ImpactItem(
+                store="Soebiz",
+                site=notifier.SITE_US,
+                category="食品和商品安全问题",
+                asin="B0H4QD9255",
+                sku="3314-BN-BASIC2",
+                reason="安全饮用水法案",
+                date="2026年6月10日",
+                impacted_text="ASIN: B0H4QD9255 SKU: 3314-BN-BASIC2",
+                sales_risk="过去 12 个月无销量",
+                action="商品已移除",
+                rating_impact="无影响",
+            ),
+        ]
+
+    def test_notification_title_is_human_date_without_run_id(self) -> None:
+        title = notifier.notification_title(notifier.datetime(2026, 6, 26, 9, 30, 0))
+
+        self.assertEqual(title, "2026年6月26日亚马逊账号状况异常新增通知")
+        self.assertNotIn("_", title)
+
+    def test_render_markdown_groups_by_store_and_omits_repeated_noise(self) -> None:
+        markdown = notifier.render_markdown(self._items(), "2026年6月26日亚马逊账号状况异常新增通知", 1, 1)
+
+        self.assertIn("**先看结论**", markdown)
+        self.assertIn("#### 店铺: Artiqua", markdown)
+        self.assertIn("#### 店铺: Soebiz", markdown)
+        self.assertIn("共 2 条", markdown)
+        self.assertIn("---", markdown)
+        self.assertIn("问题类型: 违反受限商品政策 | ASIN: `B0GDFJ9B4J`", markdown)
+        self.assertIn("SKU: `SK0042-B-00BN`", markdown)
+        self.assertNotIn("处理优先级", markdown)
+        self.assertNotIn("过去 12 个月无销量", markdown)
+        self.assertNotIn("评级影响", markdown)
+
+
 class RunCoverageGuardTests(unittest.TestCase):
     def test_run_all_14_us_stores_allows_dry_run_without_marking_notified(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -797,34 +797,61 @@ def chunked(items: list[ImpactItem], size: int) -> list[list[ImpactItem]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def notification_title(now: datetime | None = None) -> str:
+    current = now or datetime.now()
+    return f"{current.year}年{current.month}月{current.day}日亚马逊账号状况异常新增通知"
+
+
+def _count_by(items: list[ImpactItem], field: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in items:
+        value = clean_text(getattr(item, field, "")) or "未识别"
+        counts[value] = counts.get(value, 0) + 1
+    return dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0])))
+
+
+def _group_items(items: list[ImpactItem]) -> dict[str, dict[str, list[ImpactItem]]]:
+    grouped: dict[str, dict[str, list[ImpactItem]]] = {}
+    for item in sorted(items, key=lambda value: (value.store, value.category, value.date, value.asin, value.sku)):
+        store = item.store or "未识别店铺"
+        category = item.category or "未识别问题"
+        grouped.setdefault(store, {}).setdefault(category, []).append(item)
+    return grouped
+
+
 def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk_total: int) -> str:
+    store_counts = _count_by(items, "store")
+    category_counts = _count_by(items, "category")
+    store_summary = ", ".join(f"{store} {count}条" for store, count in store_counts.items()) or "无"
+    category_summary = ", ".join(f"{category} {count}条" for category, count in category_counts.items()) or "无"
     lines = [
         f"### {title}",
         "",
-        f"- 本次新增/变化: {len(items)} 条",
+        "**先看结论**",
+        f"- 新增/变化: {len(items)} 条",
+        f"- 涉及店铺: {len(store_counts)} 个, {store_summary}",
+        f"- 问题类型: {category_summary}",
         f"- 范围: {SITE_US}站, 未解决账号状况异常",
     ]
     if chunk_total > 1:
         lines.append(f"- 分段: {chunk_index}/{chunk_total}")
-    lines.append("")
+    lines.extend(["", "**明细**"])
 
-    for item in items:
-        asin = item.asin or "未识别"
-        sku = item.sku or "未识别"
-        lines.append(f"#### {item.store} / {item.category}")
-        lines.append(f"- ASIN: `{asin}`")
-        lines.append(f"- SKU: `{sku}`")
-        if item.date:
-            lines.append(f"- 日期: {item.date}")
-        if item.reason:
-            lines.append(f"- 原因: {item.reason}")
-        if item.sales_risk:
-            lines.append(f"- 销售风险: {item.sales_risk}")
-        if item.action:
-            lines.append(f"- 操作: {item.action}")
-        if item.rating_impact:
-            lines.append(f"- 评级影响: {item.rating_impact}")
-        lines.append("")
+    for store, categories in _group_items(items).items():
+        store_total = sum(len(group) for group in categories.values())
+        lines.extend(["", "---", "", f"#### 店铺: {store}", f"共 {store_total} 条"])
+        for category, group in categories.items():
+            lines.append(f"**{category}: {len(group)} 条**")
+            for index, item in enumerate(group, start=1):
+                asin = item.asin or "未识别"
+                sku = item.sku or "未识别"
+                date_text = item.date or "未识别"
+                action_text = item.action or "待确认"
+                lines.append(
+                    f"{index}. 问题类型: {category} | ASIN: `{asin}` | 日期: {date_text} | 当前处理: {action_text}"
+                )
+                lines.append(f"   SKU: `{sku}`")
+            lines.append("")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -1713,9 +1740,9 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
                 dry_run = True
 
             chunks = chunked(candidates, max_items)
-            title_prefix = clean_text(config.get("dingtalk", {}).get("title_prefix") or "亚马逊账号状况异常")
+            title_base = notification_title()
             for index, chunk in enumerate(chunks, start=1):
-                title = f"{title_prefix}新增通知 {run_id}"
+                title = title_base if len(chunks) == 1 else f"{title_base} ({index}/{len(chunks)})"
                 markdown = render_markdown(chunk, title, index, len(chunks))
                 try:
                     result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
