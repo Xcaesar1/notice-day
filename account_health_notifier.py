@@ -572,7 +572,14 @@ def extract_products(text: str) -> list[dict[str, str]]:
 def item_from_detail_row(row: dict[str, str], source_file: str) -> list[ImpactItem]:
     site = clean_text(row.get("站点") or SITE_US)
     impacted_text = clean_text(row.get("哪些商品会受到影响？"))
-    products = extract_products(impacted_text)
+    direct_asin = clean_text(row.get("ASIN")).upper()
+    direct_sku = clean_text(row.get("SKU"))
+    if direct_asin or direct_sku:
+        products = [{"asin": direct_asin, "sku": direct_sku}]
+        if not impacted_text:
+            impacted_text = clean_text(f"ASIN: {direct_asin} SKU: {direct_sku}")
+    else:
+        products = extract_products(impacted_text)
     items = []
     for product in products:
         if not clean_text(product.get("asin")) and not clean_text(product.get("sku")):
@@ -634,6 +641,29 @@ def load_items_from_excel(path: Path, target_site: str = SITE_US) -> list[Impact
             continue
         items.extend(item_from_detail_row(row, str(path)))
     return dedupe_items(items)
+
+
+def load_covered_stores_from_excel(path: Path, target_site: str = SITE_US) -> list[str]:
+    if not path.is_file():
+        return []
+    workbook = read_xlsx_workbook(path)
+    target_rows = workbook.get("Target Results")
+    if not target_rows:
+        return []
+    stores: list[str] = []
+    seen: set[str] = set()
+    for row in rows_to_dicts(target_rows):
+        status = clean_text(row.get("status"))
+        store = clean_text(row.get("store") or row.get("店铺"))
+        site = clean_text(row.get("site") or row.get("站点") or target_site)
+        if status != "success" or not store or not site_matches(site, target_site):
+            continue
+        key = normalize_for_key(store)
+        if key in seen:
+            continue
+        seen.add(key)
+        stores.append(store)
+    return stores
 
 
 def dedupe_items(items: list[ImpactItem]) -> list[ImpactItem]:
@@ -1300,6 +1330,24 @@ def build_coverage_summary(config: dict[str, Any], args: argparse.Namespace, ite
     target_site = getattr(args, "site", "") or source_config.get("site") or SITE_US
     expected_stores = load_expected_stores(store_list_path, target_site)
     summary = summarize_items(items, expected_stores=expected_stores)
+    source_excel_text = clean_text(getattr(args, "source_excel", "") or source_config.get("excel_path") or "")
+    covered_stores = (
+        load_covered_stores_from_excel(Path(source_excel_text), target_site)
+        if source_excel_text
+        else []
+    )
+    if expected_stores and covered_stores:
+        covered_keys = {normalize_for_key(store) for store in covered_stores}
+        expected_keys = {normalize_for_key(store) for store in expected_stores}
+        summary["missing_stores"] = [
+            store for store in expected_stores if normalize_for_key(store) not in covered_keys
+        ]
+        summary["extra_stores"] = [
+            store for store in covered_stores if normalize_for_key(store) not in expected_keys
+        ]
+        summary["coverage_ok"] = not summary["missing_stores"]
+        summary["covered_store_count"] = len(covered_stores)
+        summary["covered_stores"] = covered_stores
     summary["store_list_path"] = str(store_list_path)
     summary["target_site"] = target_site
     return summary

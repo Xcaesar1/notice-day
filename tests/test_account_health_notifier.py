@@ -76,6 +76,23 @@ class ProductExtractionTests(unittest.TestCase):
 
         self.assertEqual(products, [{"asin": "B0F6NCL5SH", "sku": ""}])
 
+    def test_detail_row_uses_direct_asin_sku_columns(self) -> None:
+        row = {
+            "店铺": "Wowkk",
+            "站点": notifier.SITE_US,
+            "异常分类": "违反受限商品政策",
+            "ASIN": "B0GPWKH5JH",
+            "SKU": "1161SY-BG3 APF1",
+            "原因": "3P Penalty Recovery violation",
+            "日期": "2026年6月15日",
+        }
+
+        items = notifier.item_from_detail_row(row, "zclaw.xlsx")
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].asin, "B0GPWKH5JH")
+        self.assertEqual(items[0].sku, "1161SY-BG3 APF1")
+
 
 class CoverageSummaryTests(unittest.TestCase):
     def test_summary_reports_missing_expected_stores(self) -> None:
@@ -545,6 +562,61 @@ class ExcelEndToEndTests(unittest.TestCase):
             summary_rows = notifier.rows_to_dicts(workbook["解析汇总"])
             self.assertEqual(len(detail_rows), 2)
             self.assertIn("Hangoro", {row["名称"] for row in summary_rows if row["维度"] == "覆盖缺失店铺"})
+
+    def test_parse_zclaw_collect_excel_uses_target_results_for_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_excel = root / "zclaw.xlsx"
+            store_list = root / "stores.xlsx"
+            output_dir = root / "out"
+            notifier.write_collect_open_xlsx(
+                source_excel,
+                [
+                    {
+                        "run_id": "run-1",
+                        "店铺": "BYF",
+                        "站点": notifier.SITE_US,
+                        "异常分类": "食品和商品安全问题",
+                        "ASIN": "B0FPKWYF49",
+                        "SKU": "BF-9901-BN",
+                        "原因": "安全饮用水法案",
+                        "日期": "2026年6月10日",
+                    }
+                ],
+                [
+                    {"run_id": "run-1", "store": "BYF", "site": notifier.SITE_US, "status": "success"},
+                    {"run_id": "run-1", "store": "Hangoro", "site": notifier.SITE_US, "status": "success"},
+                ],
+                {},
+            )
+            write_single_sheet_xlsx(
+                store_list,
+                "店铺执行清单",
+                ["店铺", "站点"],
+                [
+                    {"店铺": "BYF", "站点": notifier.SITE_US},
+                    {"店铺": "Hangoro", "站点": notifier.SITE_US},
+                ],
+            )
+            args = argparse.Namespace(
+                config=str(root / "missing-config.json"),
+                state_dir=str(root),
+                source_type="excel",
+                source_excel=str(source_excel),
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list=str(store_list),
+                output_dir=str(output_dir),
+                require_all_stores=True,
+            )
+
+            result = notifier.execute_parse(args)
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["coverage_ok"])
+            self.assertEqual(result["covered_store_count"], 2)
+            self.assertEqual(result["missing_stores"], [])
+            self.assertEqual(result["total_items"], 1)
 
     def test_find_latest_excel_ignores_generated_notifier_reports(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
