@@ -2,7 +2,14 @@
 
 亚马逊 Seller Central 账号状况异常商品通知器。
 
-当前版本用于 Office-PC 本地定时运行:
+当前版本按单主机生产模式运行:
+
+- NotePC 用于开发, 调试和稳定性验证.
+- Office-PC 用于唯一生产定时运行和唯一钉钉真实发送.
+
+生产运行细节见 `docs/single-primary-pc-runbook.md`.
+
+当前能力:
 
 - 通过紫鸟浏览器 CDP 直连能力检查 Seller Central 页面是否可读。
 - 从账号状况结果 Excel 读取未解决异常明细。
@@ -96,6 +103,7 @@ python account_health_notifier.py install-schedule --json
 启用真实定时通知前, 建议先运行 `parse --require-all-stores`: 只有 `coverage_ok=true` 时才代表本次结果覆盖店铺清单里的全部美国站店铺。
 正式 `run` 默认启用 `require_all_stores_before_send`; 如果店铺清单无法读取或美国站店铺缺失, 会返回 `coverage_failed` 并且不会进入钉钉发送。
 `install-schedule` 默认会执行 `--require-send-ready` 级别预检; 缺少 Webhook, Secret 或 `send_enabled=true` 时会返回 `preflight_failed`, 不会安装任务计划。
+只有 Office-PC 允许启用 `send_enabled=true` 和安装 6 小时任务计划. NotePC 保持开发验证用途, 避免重复推送.
 
 ## 安全边界
 
