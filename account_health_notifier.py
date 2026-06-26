@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 
 import cdp_account_health
 import ziniao_cdp
+import zclaw_account_health
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -2156,6 +2157,103 @@ def execute_cdp_collect_open(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def execute_zclaw_collect_stores(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    start_date = clean_text(args.start_date)
+    end_date = clean_text(args.end_date)
+    if not start_date or not end_date:
+        start_date, end_date = zclaw_account_health.current_month_range()
+    source_config = config.get("source", {})
+    target_site = clean_text(args.site) or clean_text(source_config.get("site")) or SITE_US
+    categories = zclaw_account_health.selected_categories(args.categories)
+    zclaw_args = zclaw_account_health.build_args(config, args)
+    collection = zclaw_account_health.collect_visible_account_health(
+        start_date=start_date,
+        end_date=end_date,
+        categories=categories,
+        stores=args.stores,
+        limit=int(args.limit or 0),
+        page_size=zclaw_args["page_size"],
+        max_pages=zclaw_args["max_pages"],
+        close_after=not args.keep_open,
+        open_timeout=zclaw_args["open_timeout"],
+        nav_timeout=zclaw_args["nav_timeout"],
+        exec_timeout=zclaw_args["exec_timeout"],
+    )
+
+    run_id = run_id_text()
+    target_results = [sanitized_target_result(result) for result in collection.get("target_results", [])]
+    source_file = "zclaw-stores"
+    items = [
+        impact_item_from_cdp_row(row, source_file)
+        for row in collection.get("rows", [])
+        if site_matches(clean_text(row.get("site")), target_site)
+    ]
+    item_rows = [item.to_row(run_id, "zclaw_collected") for item in items]
+    target_rows = cdp_target_result_rows(run_id, target_results)
+
+    expected_stores = [clean_text(store) for store in collection.get("selected_stores", []) if clean_text(store)]
+    summary = cdp_open_summary(
+        items,
+        expected_stores=expected_stores,
+        target_results=target_results,
+        target_site=target_site,
+        store_list_path="ziniao-cli store list",
+        store_list_error="",
+    )
+    target_failures = [result for result in target_results if not result.get("ok")]
+    if not target_results:
+        status = "no_targets"
+    elif target_failures:
+        status = "partial_failed"
+    elif summary.get("missing_stores"):
+        status = "partial"
+    else:
+        status = "success"
+    ok = bool(target_results) and not target_failures and not summary.get("missing_stores")
+
+    result_dir = Path(args.output_dir or config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
+    artifact = result_dir / f"account-health-zclaw-stores-{run_id}.xlsx"
+    write_collect_open_xlsx(artifact, item_rows, target_rows, summary)
+    json_artifact = result_dir / f"account-health-zclaw-stores-{run_id}.json"
+    json_artifact.parent.mkdir(parents=True, exist_ok=True)
+    json_payload = {
+        "run_id": run_id,
+        "status": status,
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_site": target_site,
+        "row_count": len(items),
+        "target_count": len(target_results),
+        "target_results": target_results,
+        "missing_stores": summary.get("missing_stores", []),
+        "opened_stores": summary.get("opened_stores", []),
+        "rows": [item.to_row(run_id, "zclaw_collected") for item in items],
+    }
+    json_artifact.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    payload = {
+        "ok": ok,
+        "status": status,
+        "run_id": run_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_site": target_site,
+        "row_count": len(items),
+        "target_count": len(target_results),
+        "artifact": str(artifact),
+        "json_artifact": str(json_artifact),
+        "target_results": target_results,
+        **summary,
+    }
+    if args.include_items:
+        payload["items"] = [item.to_row(run_id, "zclaw_collected") for item in items]
+    else:
+        payload["items_preview"] = [item.to_row(run_id, "zclaw_collected") for item in items[:20]]
+    return payload
+
+
 def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(args.config or DEFAULT_CONFIG_PATH)
     config = load_config(config_path)
@@ -2493,6 +2591,24 @@ def build_parser() -> argparse.ArgumentParser:
     cdp_collect_open.add_argument("--output-dir", default="", help="output directory")
     cdp_collect_open.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
     cdp_collect_open.set_defaults(func=execute_cdp_collect_open)
+
+    zclaw_collect = sub.add_parser("zclaw-collect-stores", help="Collect account health issues through Ziniao ZClaw store/page commands")
+    add_common(zclaw_collect)
+    zclaw_collect.add_argument("--start-date", default="", help="start date YYYY-MM-DD, defaults to current month start")
+    zclaw_collect.add_argument("--end-date", default="", help="end date YYYY-MM-DD, defaults to today")
+    zclaw_collect.add_argument("--categories", default="all", help="all or comma-separated policy keys")
+    zclaw_collect.add_argument("--stores", default="", help="comma-separated store names or store IDs; defaults to all visible Amazon US stores")
+    zclaw_collect.add_argument("--limit", type=int, default=0, help="limit selected stores for smoke testing")
+    zclaw_collect.add_argument("--site", default="", help="target site")
+    zclaw_collect.add_argument("--page-size", type=int, default=0, help="API page size")
+    zclaw_collect.add_argument("--max-pages", type=int, default=0, help="maximum pages per category")
+    zclaw_collect.add_argument("--open-timeout", type=int, default=0, help="store open timeout seconds")
+    zclaw_collect.add_argument("--nav-timeout", type=int, default=0, help="page navigation timeout seconds")
+    zclaw_collect.add_argument("--exec-timeout", type=int, default=0, help="page script timeout seconds")
+    zclaw_collect.add_argument("--keep-open", action="store_true", help="do not close store windows after collection")
+    zclaw_collect.add_argument("--output-dir", default="", help="output directory")
+    zclaw_collect.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
+    zclaw_collect.set_defaults(func=execute_zclaw_collect_stores)
 
     send_test = sub.add_parser("send-test", help="发送或 dry-run 一条测试消息")
     add_common(send_test)

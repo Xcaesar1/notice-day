@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 import account_health_notifier as notifier  # noqa: E402
 import cdp_account_health  # noqa: E402
 import ziniao_cdp  # noqa: E402
+import zclaw_account_health  # noqa: E402
 
 
 def write_single_sheet_xlsx(path: Path, sheet_name: str, headers: list[str], rows: list[dict[str, str]]) -> None:
@@ -101,6 +102,34 @@ class CoverageSummaryTests(unittest.TestCase):
         self.assertEqual(summary["store_count"], 1)
         self.assertEqual(summary["missing_stores"], ["Hangoro"])
         self.assertEqual(summary["missing_asin"], 0)
+
+
+class ZclawLoginDetectionTests(unittest.TestCase):
+    def test_signin_url_is_not_business_page(self) -> None:
+        state = {"url": "https://sellercentral.amazon.com/ap/signin?clientContext=x", "ready": "complete"}
+
+        self.assertFalse(zclaw_account_health._is_seller_business_page(state))
+
+    def test_business_url_is_business_page(self) -> None:
+        state = {
+            "url": "https://sellercentral.amazon.com/performance/account/health/product-policies",
+            "ready": "complete",
+        }
+
+        self.assertTrue(zclaw_account_health._is_seller_business_page(state))
+
+    def test_chinese_and_english_account_switchers_are_detected(self) -> None:
+        chinese_state = {
+            "url": "https://sellercentral.amazon.com/ap/signin",
+            "text": "切换账户 hanallx 添加账户",
+        }
+        english_state = {
+            "url": "https://sellercentral.amazon.com/ap/signin",
+            "text": "Switch accounts Wowkk Sanitary Ware Add account",
+        }
+
+        self.assertTrue(zclaw_account_health._looks_like_account_switcher(chinese_state))
+        self.assertTrue(zclaw_account_health._looks_like_account_switcher(english_state))
 
 
 class ZiniaoCdpTests(unittest.TestCase):
