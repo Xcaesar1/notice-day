@@ -814,6 +814,28 @@ class NotificationRenderingTests(unittest.TestCase):
         self.assertEqual(title, "2026年6月26日亚马逊账号状况异常新增通知")
         self.assertNotIn("_", title)
 
+    def test_dingtalk_issue_field_block_template_is_reusable(self) -> None:
+        block = notifier.render_dingtalk_issue_field_block(
+            1,
+            "违反受限商品政策",
+            "2026年6月14日",
+            "已发送警告",
+            "B0GDFLJY1F",
+            "SK0042-A-00ORB",
+        )
+
+        self.assertEqual(notifier.DINGTALK_MARKDOWN_TEMPLATE, "field-block-v1")
+        self.assertEqual(
+            block,
+            [
+                "1. 问题类型: 违反受限商品政策  ",
+                "   日期: 2026年6月14日  ",
+                "   当前处理: 已发送警告  ",
+                "   ASIN: **B0GDFLJY1F**  ",
+                "   SKU: **SK0042-A-00ORB**",
+            ],
+        )
+
     def test_render_markdown_groups_by_store_and_omits_repeated_noise(self) -> None:
         markdown = notifier.render_markdown(self._items(), "2026年6月26日亚马逊账号状况异常新增通知", 1, 1)
 

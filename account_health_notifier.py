@@ -819,6 +819,26 @@ def _group_items(items: list[ImpactItem]) -> dict[str, dict[str, list[ImpactItem
     return grouped
 
 
+DINGTALK_MARKDOWN_TEMPLATE = "field-block-v1"
+
+
+def render_dingtalk_issue_field_block(
+    index: int,
+    category: str,
+    date_text: str,
+    action_text: str,
+    asin: str,
+    sku: str,
+) -> list[str]:
+    return [
+        f"{index}. 问题类型: {category}  ",
+        f"   日期: {date_text}  ",
+        f"   当前处理: {action_text}  ",
+        f"   ASIN: **{asin}**  ",
+        f"   SKU: **{sku}**",
+    ]
+
+
 def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk_total: int) -> str:
     store_counts = _count_by(items, "store")
     category_counts = _count_by(items, "category")
@@ -849,11 +869,9 @@ def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk
                 sku = item.sku or "未识别"
                 date_text = item.date or "未识别"
                 action_text = item.action or "待确认"
-                lines.append(f"{index}. 问题类型: {category}  ")
-                lines.append(f"   日期: {date_text}  ")
-                lines.append(f"   当前处理: {action_text}  ")
-                lines.append(f"   ASIN: **{asin}**  ")
-                lines.append(f"   SKU: **{sku}**")
+                lines.extend(
+                    render_dingtalk_issue_field_block(index, category, date_text, action_text, asin, sku)
+                )
             lines.append("")
     return "\n".join(lines).strip() + "\n"
 
