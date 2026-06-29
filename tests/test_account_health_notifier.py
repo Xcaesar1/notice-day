@@ -2095,6 +2095,33 @@ class ZiniaoWebdriverTests(unittest.TestCase):
 
         self.assertEqual([item.browser_name for item in selected], ["BYF"])
 
+    def test_wait_for_page_target_prefers_sellercentral_over_about_blank(self) -> None:
+        with mock.patch.object(
+            ziniao_cdp,
+            "list_targets",
+            return_value=[
+                ziniao_cdp.CdpTarget(
+                    port=15157,
+                    id="blank",
+                    type="page",
+                    title="about:blank",
+                    url="about:blank",
+                    web_socket_debugger_url="ws://127.0.0.1:15157/devtools/page/blank",
+                ),
+                ziniao_cdp.CdpTarget(
+                    port=15157,
+                    id="seller",
+                    type="page",
+                    title="新的亚马逊销售体验",
+                    url="https://sellercentral.amazon.com/amazonsell/business?ref=homepage_redirect_ngs",
+                    web_socket_debugger_url="ws://127.0.0.1:15157/devtools/page/seller",
+                ),
+            ],
+        ):
+            target = ziniao_webdriver.wait_for_page_target(15157, timeout=2)
+
+        self.assertEqual(target.id, "seller")
+
     def test_start_browser_payloads_prefer_browser_id_then_browser_oauth(self) -> None:
         store = ziniao_webdriver.Store(
             browser_oauth="oauth-1",
@@ -2144,6 +2171,132 @@ class ZiniaoWebdriverTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["browserId"], "27128487964502")
         self.assertNotIn("browserOauth", calls[0])
+
+    def test_wait_for_seller_page_with_verification_clicks_account_switcher_then_returns_business_page(self) -> None:
+        target = ziniao_cdp.CdpTarget(
+            port=44610,
+            id="seller",
+            type="page",
+            title="亚马逊 登录",
+            url="https://sellercentral.amazon.com/ap/signin",
+            web_socket_debugger_url="ws://127.0.0.1:44610/devtools/page/seller",
+        )
+        switcher = {
+            "url": "https://sellercentral.amazon.com/ap/signin",
+            "readyState": "complete",
+            "body_sample": "切换账户 hanallx hanallx@outlook.com 添加账户",
+        }
+        business = {
+            "url": "https://sellercentral.amazon.com/performance/dashboard",
+            "readyState": "complete",
+            "body_sample": "账户状况 良好 政策合规性",
+        }
+
+        with mock.patch.object(
+            ziniao_webdriver,
+            "wait_for_page_target",
+            side_effect=[target, target],
+        ) as wait_target, mock.patch.object(
+            ziniao_webdriver,
+            "probe_target",
+            side_effect=[switcher, business],
+        ) as probe, mock.patch.object(
+            ziniao_webdriver,
+            "click_existing_account_if_present",
+            return_value={"clicked": True, "text": "hanallx"},
+        ) as clicker, mock.patch.object(
+            ziniao_webdriver.time,
+            "sleep",
+            return_value=None,
+        ):
+            resolved_target, snapshot = ziniao_webdriver.wait_for_seller_page_with_verification(
+                target,
+                timeout=10,
+                navigation_wait_seconds=0,
+            )
+
+        self.assertEqual(resolved_target.id, "seller")
+        self.assertEqual(snapshot["url"], "https://sellercentral.amazon.com/performance/dashboard")
+        self.assertEqual(wait_target.call_count, 2)
+        self.assertEqual(probe.call_count, 2)
+        clicker.assert_called_once_with(target, timeout=10)
+
+    def test_collect_store_account_health_recovers_from_login_verification_before_collecting(self) -> None:
+        store = ziniao_webdriver.Store(
+            browser_oauth="oauth-1",
+            browser_name="Wowkk",
+            site_id="1",
+            platform_id="1",
+            platform_name="Amazon-US",
+            browser_id="27128487964502",
+        )
+        credentials = ziniao_webdriver.Credentials("company", "user", "pass")
+        target = ziniao_cdp.CdpTarget(
+            port=44610,
+            id="seller",
+            type="page",
+            title="亚马逊 登录",
+            url="https://sellercentral.amazon.com/ap/signin",
+            web_socket_debugger_url="ws://127.0.0.1:44610/devtools/page/seller",
+        )
+        started = ziniao_webdriver.StartedBrowser(
+            browser_oauth="oauth-1",
+            debugging_port=44610,
+            launcher_page="https://sellercentral.amazon.com/home",
+            core_version="138.1.2.86",
+            core_type="0",
+        )
+        verified_snapshot = {
+            "url": "https://sellercentral.amazon.com/performance/dashboard",
+            "readyState": "complete",
+            "body_sample": "账户状况 良好",
+        }
+        collection = {
+            "rows": [],
+            "page_reports": [{"category": "safe", "page": 1, "violations": 0}],
+            "target": target.safe_dict(),
+        }
+
+        with mock.patch.object(ziniao_webdriver, "start_browser", return_value=started), mock.patch.object(
+            ziniao_webdriver,
+            "wait_for_page_target",
+            return_value=target,
+        ), mock.patch.object(
+            ziniao_webdriver,
+            "probe_target",
+            return_value={
+                "url": "https://sellercentral.amazon.com/ap/signin",
+                "readyState": "complete",
+                "body_sample": "切换账户 Wowkk Sanitary Ware Add account",
+            },
+        ), mock.patch.object(
+            ziniao_webdriver,
+            "wait_for_seller_page_with_verification",
+            return_value=(target, verified_snapshot),
+        ) as waiter, mock.patch.object(
+            cdp_account_health,
+            "collect_target_account_health",
+            return_value=collection,
+        ) as collector, mock.patch.object(
+            ziniao_webdriver,
+            "stop_browser",
+            return_value={},
+        ):
+            result = ziniao_webdriver.collect_store_account_health(
+                store,
+                credentials=credentials,
+                webdriver_port=9515,
+                start_date="2026-06-01",
+                end_date="2026-06-29",
+                categories=[cdp_account_health.PolicyCategory("safe", "食品和商品安全问题", "ProductSafety")],
+                close_after=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["row_count"], 0)
+        waiter.assert_called_once()
+        collector.assert_called_once()
 
 
 class RuntimeValidationTests(unittest.TestCase):

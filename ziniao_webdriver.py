@@ -433,19 +433,56 @@ def stop_browser(
     return payload
 
 
-def wait_for_page_target(debugging_port: int, timeout: int = DEFAULT_BROWSER_READY_TIMEOUT) -> ziniao_cdp.CdpTarget:
+def _target_priority(target: ziniao_cdp.CdpTarget, preferred_target_id: str = "") -> int:
+    if target.type != "page" or not clean_text(target.web_socket_debugger_url):
+        return -10_000
+    url = clean_text(target.url).lower()
+    title = clean_text(target.title).lower()
+    score = 0
+    if preferred_target_id and target.id == preferred_target_id:
+        score += 200
+    if "sellercentral.amazon.com" in url:
+        score += 150
+    if "/performance/dashboard" in url:
+        score += 80
+    if "/amazonsell/business" in url or url.endswith("/home"):
+        score += 40
+    if url == "about:blank":
+        score -= 80
+    if url.startswith("chrome-extension://"):
+        score -= 1_000
+    if "newtab" in url or "新标签页" in title:
+        score -= 40
+    return score
+
+
+def _best_page_target(
+    targets: list[ziniao_cdp.CdpTarget],
+    preferred_target_id: str = "",
+) -> ziniao_cdp.CdpTarget | None:
+    pages = [
+        target
+        for target in targets
+        if target.type == "page" and not clean_text(target.url).startswith("chrome-extension://")
+    ]
+    if not pages:
+        return None
+    return max(pages, key=lambda item: _target_priority(item, preferred_target_id=preferred_target_id))
+
+
+def wait_for_page_target(
+    debugging_port: int,
+    timeout: int = DEFAULT_BROWSER_READY_TIMEOUT,
+    preferred_target_id: str = "",
+) -> ziniao_cdp.CdpTarget:
     deadline = time.time() + max(int(timeout), 1)
     last_error = ""
     while time.time() < deadline:
         try:
             targets = ziniao_cdp.list_targets(debugging_port)
-            pages = [
-                target
-                for target in targets
-                if target.type == "page" and not clean_text(target.url).startswith("chrome-extension://")
-            ]
-            if pages:
-                return pages[0]
+            best = _best_page_target(targets, preferred_target_id=preferred_target_id)
+            if best is not None:
+                return best
         except Exception as exc:
             last_error = clean_text(exc)
         time.sleep(1)
@@ -463,7 +500,11 @@ def navigate_target(
         session.call("Page.enable")
         session.call("Page.navigate", {"url": url})
     time.sleep(max(float(wait_seconds), 0.0))
-    return wait_for_page_target(target.port, timeout=max(int(wait_seconds) + 10, 10))
+    return wait_for_page_target(
+        target.port,
+        timeout=max(int(wait_seconds) + 10, 10),
+        preferred_target_id=target.id,
+    )
 
 
 def probe_target(target: ziniao_cdp.CdpTarget, text_limit: int = 600) -> dict[str, Any]:
@@ -474,20 +515,231 @@ def probe_target(target: ziniao_cdp.CdpTarget, text_limit: int = 600) -> dict[st
         return {"error": clean_text(exc), "target": target.safe_dict()}
 
 
+def _evaluate_json(target: ziniao_cdp.CdpTarget, expression: str, timeout: float = 20.0) -> Any:
+    return ziniao_cdp.evaluate_json(target, expression, timeout=timeout)
+
+
+def _looks_like_account_switcher(snapshot: dict[str, Any]) -> bool:
+    url = clean_text(snapshot.get("url")).lower()
+    text = clean_text(snapshot.get("body_sample"))
+    return (
+        "amazon.com/ap/signin" in url
+        and (
+            ("切换账户" in text and "添加账户" in text)
+            or ("switch accounts" in text.lower() and "add account" in text.lower())
+        )
+    )
+
+
+def _looks_like_password_prompt(snapshot: dict[str, Any]) -> bool:
+    url = clean_text(snapshot.get("url")).lower()
+    text = clean_text(snapshot.get("body_sample"))
+    return (
+        "amazon.com/ap/signin" in url
+        and ("密码" in text or "Password" in text)
+        and ("登录" in text or "Sign in" in text)
+    )
+
+
+def _looks_like_email_prompt(snapshot: dict[str, Any]) -> bool:
+    url = clean_text(snapshot.get("url")).lower()
+    text = clean_text(snapshot.get("body_sample"))
+    return (
+        "amazon.com/ap/signin" in url
+        and (
+            ("输入手机号或邮箱" in text and "继续" in text)
+            or ("输入手机号码或邮箱" in text and "继续" in text)
+            or ("email or mobile phone number" in text.lower() and "continue" in text.lower())
+        )
+    )
+
+
+def _looks_like_mfa_prompt(snapshot: dict[str, Any]) -> bool:
+    url = clean_text(snapshot.get("url")).lower()
+    text = clean_text(snapshot.get("body_sample"))
+    return "/ap/mfa" in url or ("两步验证" in text and ("验证码" in text or "OTP" in text))
+
+
+def _looks_like_second_verification(snapshot: dict[str, Any]) -> bool:
+    url = clean_text(snapshot.get("url")).lower()
+    text = clean_text(snapshot.get("body_sample"))
+    if "sellercentral.amazon.com" in url and "账户状况" in text:
+        return False
+    has_continue = any(marker in text for marker in ("继续", "Continue", "CONTINUE"))
+    has_challenge = any(
+        marker in text
+        for marker in ("验证码", "OTP", "验证", "身份验证", "Verify", "Authentication", "Security check")
+    )
+    return has_continue and has_challenge
+
+
+def _is_seller_business_page(snapshot: dict[str, Any]) -> bool:
+    url = clean_text(snapshot.get("url")).lower()
+    if "sellercentral.amazon.com" not in url:
+        return False
+    if "/ap/signin" in url or "/ap/mfa" in url:
+        return False
+    return True
+
+
 def _looks_like_login_or_verification(snapshot: dict[str, Any]) -> bool:
     url = clean_text(snapshot.get("url")).lower()
     text = clean_text(snapshot.get("body_sample"))
     if "/ap/signin" in url or "/ap/mfa" in url:
         return True
-    if "切换账户" in text and "添加账户" in text:
+    if _looks_like_account_switcher(snapshot):
         return True
-    if "switch accounts" in text.lower() and "add account" in text.lower():
+    if _looks_like_email_prompt(snapshot) or _looks_like_password_prompt(snapshot):
         return True
-    if "输入手机号或邮箱" in text and "继续" in text:
-        return True
-    if "验证码" in text or "two-step verification" in text.lower():
+    if _looks_like_mfa_prompt(snapshot) or _looks_like_second_verification(snapshot):
         return True
     return False
+
+
+def click_existing_account_if_present(target: ziniao_cdp.CdpTarget, timeout: float = 20.0) -> dict[str, Any]:
+    expression = r"""
+JSON.stringify((() => {
+  const textOf = (el) => (el.innerText || el.textContent || el.value || '').trim();
+  const target =
+    document.querySelector('a.cvf-widget-btn-verify-account-switcher')
+    || Array.from(document.querySelectorAll('a,button,[role=button]')).find((el) => {
+      const text = textOf(el);
+      if (!text) return false;
+      if (/^(添加账户|Add account|退出|Sign out|了解更多|Learn more)/i.test(text)) return false;
+      return /@/.test(text) || /切换账户|Switch accounts/i.test(document.body ? document.body.innerText : '');
+    });
+  if (!target) return {clicked:false, reason:'selector not found'};
+  const text = textOf(target);
+  target.dispatchEvent(new MouseEvent('mouseover', {bubbles:true, cancelable:true, view:window}));
+  target.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+  target.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+  target.click();
+  return {clicked:true, text};
+})())
+"""
+    data = _evaluate_json(target, expression, timeout=timeout)
+    return data if isinstance(data, dict) else {"clicked": False, "result": data}
+
+
+def click_email_continue_if_ready(target: ziniao_cdp.CdpTarget, timeout: float = 20.0) -> dict[str, Any]:
+    expression = r"""
+JSON.stringify((() => {
+  const btn = document.querySelector('input#continue');
+  if (!btn) return {clicked:false, reason:'continue button not found'};
+  btn.click();
+  return {clicked:true, id:btn.id || ''};
+})())
+"""
+    data = _evaluate_json(target, expression, timeout=timeout)
+    return data if isinstance(data, dict) else {"clicked": False, "result": data}
+
+
+def click_password_login_if_ready(target: ziniao_cdp.CdpTarget, timeout: float = 20.0) -> dict[str, Any]:
+    expression = r"""
+JSON.stringify((() => {
+  const btn = document.querySelector('input#signInSubmit');
+  if (!btn) return {clicked:false, reason:'signInSubmit not found'};
+  btn.click();
+  return {clicked:true, id:btn.id || ''};
+})())
+"""
+    data = _evaluate_json(target, expression, timeout=timeout)
+    return data if isinstance(data, dict) else {"clicked": False, "result": data}
+
+
+def click_mfa_login_if_ready(target: ziniao_cdp.CdpTarget, timeout: float = 20.0) -> dict[str, Any]:
+    expression = r"""
+JSON.stringify((() => {
+  const otp = document.querySelector('#auth-mfa-otpcode,input[name=otpCode],input[type=tel]');
+  const length = otp ? (otp.value || '').length : 0;
+  if (length < 6) return {clicked:false, reason:'otp not ready', otpLength:length};
+  const btn = document.querySelector('#auth-signin-button')
+    || Array.from(document.querySelectorAll('button,input[type=submit]')).find((el) => /^(登录|Sign in|Continue|继续)$/i.test((el.innerText || el.value || '').trim()));
+  if (!btn) return {clicked:false, reason:'mfa submit not found', otpLength:length};
+  btn.click();
+  return {clicked:true, otpLength:length, id:btn.id || ''};
+})())
+"""
+    data = _evaluate_json(target, expression, timeout=timeout)
+    return data if isinstance(data, dict) else {"clicked": False, "result": data}
+
+
+def click_continue_if_present(target: ziniao_cdp.CdpTarget, timeout: float = 20.0) -> dict[str, Any]:
+    expression = r"""
+JSON.stringify((() => {
+  const nodes = Array.from(document.querySelectorAll('button,input[type=submit],input[type=button],a'));
+  const visible = (el) => {
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+  };
+  const textOf = (el) => (el.innerText || el.value || el.getAttribute('aria-label') || el.textContent || '').trim();
+  const target = nodes.find((el) => visible(el) && !el.disabled && /^(继续|Continue)$/i.test(textOf(el)));
+  if (target) {
+    const text = textOf(target);
+    target.click();
+    return {clicked: true, text};
+  }
+  return {
+    clicked: false,
+    candidates: nodes.map(textOf).filter(Boolean).slice(0, 20)
+  };
+})())
+"""
+    data = _evaluate_json(target, expression, timeout=timeout)
+    return data if isinstance(data, dict) else {"clicked": False, "result": data}
+
+
+def wait_for_seller_page_with_verification(
+    target: ziniao_cdp.CdpTarget,
+    timeout: int = 90,
+    navigation_wait_seconds: float = DEFAULT_NAVIGATION_WAIT_SECONDS,
+) -> tuple[ziniao_cdp.CdpTarget, dict[str, Any]]:
+    deadline = time.time() + max(int(timeout), 1)
+    last_snapshot: dict[str, Any] = {}
+    last_action = ""
+    last_error = ""
+    current = target
+    while time.time() < deadline:
+        try:
+            current = wait_for_page_target(current.port, timeout=10, preferred_target_id=current.id)
+            snapshot = probe_target(current, text_limit=2000)
+            last_snapshot = snapshot
+            if snapshot.get("readyState") == "complete" and _is_seller_business_page(snapshot):
+                return current, snapshot
+            if _looks_like_account_switcher(snapshot):
+                click_result = click_existing_account_if_present(current, timeout=10)
+                last_action = f"account_switcher:{click_result}"
+                time.sleep(5 if click_result.get("clicked") else 2)
+                continue
+            if _looks_like_email_prompt(snapshot):
+                click_result = click_email_continue_if_ready(current, timeout=10)
+                last_action = f"email_continue:{click_result}"
+                time.sleep(5 if click_result.get("clicked") else 2)
+                continue
+            if _looks_like_password_prompt(snapshot):
+                click_result = click_password_login_if_ready(current, timeout=10)
+                last_action = f"password_login:{click_result}"
+                time.sleep(5 if click_result.get("clicked") else 2)
+                continue
+            if _looks_like_mfa_prompt(snapshot):
+                click_result = click_mfa_login_if_ready(current, timeout=10)
+                last_action = f"mfa_continue:{click_result}"
+                time.sleep(5 if click_result.get("clicked") else 2)
+                continue
+            if _looks_like_second_verification(snapshot):
+                click_result = click_continue_if_present(current, timeout=10)
+                last_action = f"verification_continue:{click_result}"
+                time.sleep(5 if click_result.get("clicked") else 2)
+                continue
+        except Exception as exc:
+            last_error = clean_text(exc)
+        time.sleep(max(float(navigation_wait_seconds), 1.0))
+    raise ZiniaoWebDriverError(
+        "Amazon login or verification is still required after automatic handling: "
+        f"{clean_text(last_snapshot.get('url'))} | {clean_text(last_snapshot.get('body_sample'))[:300]} "
+        f"| lastAction={last_action} | lastError={last_error}"
+    )
 
 
 def collect_store_account_health(
@@ -527,9 +779,16 @@ def collect_store_account_health(
             target = navigate_target(target, PERFORMANCE_DASHBOARD_URL, wait_seconds=navigation_wait_seconds)
         page_snapshot = probe_target(target, text_limit=800)
         if _looks_like_login_or_verification(page_snapshot):
-            raise ZiniaoWebDriverError(
-                f"Amazon login or verification is required for {store.browser_name}: "
-                f"{clean_text(page_snapshot.get('url'))} | {clean_text(page_snapshot.get('body_sample'))[:300]}"
+            target, page_snapshot = wait_for_seller_page_with_verification(
+                target,
+                timeout=max(browser_ready_timeout, 90),
+                navigation_wait_seconds=navigation_wait_seconds,
+            )
+        elif page_snapshot.get("readyState") != "complete" or not _is_seller_business_page(page_snapshot):
+            target, page_snapshot = wait_for_seller_page_with_verification(
+                target,
+                timeout=max(browser_ready_timeout, 45),
+                navigation_wait_seconds=navigation_wait_seconds,
             )
         result = cdp_account_health.collect_target_account_health(
             target,
