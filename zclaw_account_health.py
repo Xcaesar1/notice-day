@@ -79,7 +79,11 @@ def _ziniao_cli_command() -> list[str]:
     return [fallback if Path(fallback).is_file() else "ziniao-cli"]
 
 
-def list_stores(timeout: int = 30) -> list[Store]:
+def prepare_agent(timeout: int = 30) -> dict[str, Any]:
+    return _run_cli(["store", "prepare-agent"], timeout=timeout)
+
+
+def _list_stores_once(timeout: int = 30) -> list[Store]:
     payload = _run_cli(["store", "list", "--all", "--format", "json"], timeout=timeout)
     data = payload.get("data") if isinstance(payload, dict) else {}
     items = data.get("items") if isinstance(data, dict) else []
@@ -96,6 +100,19 @@ def list_stores(timeout: int = 30) -> list[Store]:
             )
         )
     return [store for store in stores if store.store_id and store.store_name]
+
+
+def list_stores(timeout: int = 30) -> list[Store]:
+    for attempt in range(2):
+        try:
+            prepare_agent(timeout=min(timeout, 30))
+        except Exception:
+            pass
+        stores = _list_stores_once(timeout=timeout)
+        if stores or attempt == 1:
+            return stores
+        time.sleep(1)
+    return []
 
 
 def filter_us_amazon_stores(stores: list[Store]) -> list[Store]:
@@ -127,7 +144,7 @@ def select_stores(stores: list[Store], names_or_ids: str = "", limit: int = 0) -
     return selected
 
 
-def open_store(store: Store, url: str = PRODUCT_POLICIES_URL, timeout: int = DEFAULT_OPEN_TIMEOUT) -> dict[str, Any]:
+def _open_store_once(store: Store, url: str = PRODUCT_POLICIES_URL, timeout: int = DEFAULT_OPEN_TIMEOUT) -> dict[str, Any]:
     args = ["store", "open", "--name", store.store_name, "--expected-name", store.store_name]
     if url:
         args.extend(["--url", url])
@@ -144,6 +161,24 @@ def open_store(store: Store, url: str = PRODUCT_POLICIES_URL, timeout: int = DEF
                 f"store open failed by name and id for {store.store_name}: "
                 f"name={clean_text(name_exc)}; id={clean_text(id_exc)}"
             ) from id_exc
+
+
+def open_store(store: Store, url: str = PRODUCT_POLICIES_URL, timeout: int = DEFAULT_OPEN_TIMEOUT) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(2):
+        if attempt:
+            try:
+                prepare_agent(timeout=min(timeout, 30))
+            except Exception:
+                pass
+            time.sleep(1)
+        try:
+            return _open_store_once(store, url=url, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+    if last_error:
+        raise last_error
+    raise ZclawError(f"store open failed for {store.store_name}")
 
 
 def close_store(store: Store, timeout: int = 20) -> dict[str, Any]:

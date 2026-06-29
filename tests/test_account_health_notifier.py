@@ -149,6 +149,37 @@ class ZclawLoginDetectionTests(unittest.TestCase):
         self.assertTrue(zclaw_account_health._looks_like_account_switcher(english_state))
 
 
+class ZclawBridgeTests(unittest.TestCase):
+    def test_list_stores_retries_after_prepare_agent_when_first_result_is_empty(self) -> None:
+        responses = [
+            {"ok": True, "data": None},
+            {"ok": True, "data": {"items": []}},
+            {"ok": True, "data": None},
+            {
+                "ok": True,
+                "data": {
+                    "items": [
+                        {
+                            "storeId": "27212769168763",
+                            "storeName": "BYF",
+                            "platformName": "亚马逊-美国",
+                            "ip": "36.140.87.12",
+                        }
+                    ]
+                },
+            },
+        ]
+
+        with mock.patch.object(zclaw_account_health, "_run_cli", side_effect=responses) as patched:
+            with mock.patch.object(zclaw_account_health.time, "sleep", return_value=None):
+                stores = zclaw_account_health.list_stores()
+
+        self.assertEqual(len(stores), 1)
+        self.assertEqual(stores[0].store_name, "BYF")
+        self.assertEqual(patched.call_args_list[0].args[0], ["store", "prepare-agent"])
+        self.assertEqual(patched.call_args_list[1].args[0], ["store", "list", "--all", "--format", "json"])
+
+
 class ZiniaoCdpTests(unittest.TestCase):
     def test_find_targets_returns_only_matching_seller_pages(self) -> None:
         with mock.patch.object(
@@ -1503,6 +1534,50 @@ class ProductionRunTests(unittest.TestCase):
             self.assertEqual(result["error"], "missing stores: Hanallx")
             run_mock.assert_not_called()
 
+    def test_run_blocks_real_send_when_current_host_is_not_primary_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["dingtalk"]["method"] = "webhook"
+            config["dingtalk"]["webhook_url"] = "https://oapi.dingtalk.com/robot/send?access_token=test"
+            config["dingtalk"]["secret"] = "SECtest"
+            config["dingtalk"]["send_enabled"] = True
+            config["notify"]["require_all_stores_before_send"] = False
+            config["runtime"]["primary_host"] = "OFFICE-PC"
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=False,
+                send=True,
+            )
+
+            with mock.patch.object(notifier, "current_host_name", return_value="NOTE-PC"):
+                result = notifier.execute_run(args)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["status"], "host_blocked")
+            self.assertIn("OFFICE-PC", result["error"])
+            conn = notifier.connect_db(root / "state.sqlite")
+            try:
+                attempt_count = conn.execute("SELECT COUNT(*) FROM notification_attempts").fetchone()[0]
+                notified_count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+            finally:
+                conn.close()
+            self.assertEqual(attempt_count, 0)
+            self.assertEqual(notified_count, 0)
+
 
 class ConfigValidationTests(unittest.TestCase):
     def _base_config_path(self, root: Path) -> Path:
@@ -1541,6 +1616,7 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertIn("webhook_url_missing", codes)
             self.assertIn("webhook_secret_missing", codes)
             self.assertIn("send_enabled_false", codes)
+            self.assertIn("primary_host_missing", codes)
 
     def test_validate_config_reports_missing_config_without_exception(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1613,6 +1689,7 @@ class ConfigValidationTests(unittest.TestCase):
             config["dingtalk"]["webhook_url"] = "https://oapi.dingtalk.com/robot/send?access_token=test"
             config["dingtalk"]["secret"] = "SECtest"
             config["dingtalk"]["send_enabled"] = True
+            config["runtime"]["primary_host"] = "NOTE-PC"
             config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
             args = argparse.Namespace(
                 config=str(config_path),
@@ -1625,12 +1702,51 @@ class ConfigValidationTests(unittest.TestCase):
                 skip_preflight=False,
             )
 
-            result = notifier.execute_install_schedule(args)
+            with mock.patch.object(notifier, "current_host_name", return_value="NOTE-PC"):
+                result = notifier.execute_install_schedule(args)
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["status"], "dry_run")
             self.assertIn("production-run", " ".join(result["command"]))
             self.assertNotIn("source_excel_dir_missing", {issue["code"] for issue in result["issues"]})
+
+    def test_validate_config_production_run_does_not_require_excel_source_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["source"]["excel_dir"] = str(root / "missing-source-dir")
+            config["schedule"]["command"] = "production-run"
+            config["dingtalk"]["webhook_url"] = "https://oapi.dingtalk.com/robot/send?access_token=test"
+            config["dingtalk"]["secret"] = "SECtest"
+            config["dingtalk"]["send_enabled"] = True
+            config["runtime"]["primary_host"] = "NOTE-PC"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(config=str(config_path), state_dir=str(root), require_send_ready=True)
+
+            with mock.patch.object(notifier, "current_host_name", return_value="NOTE-PC"):
+                result = notifier.execute_validate_config(args)
+
+            self.assertTrue(result["ok"])
+            self.assertNotIn("source_excel_dir_missing", {issue["code"] for issue in result["issues"]})
+
+    def test_validate_config_rejects_wrong_primary_host_for_send_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = self._base_config_path(root)
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            config["dingtalk"]["webhook_url"] = "https://oapi.dingtalk.com/robot/send?access_token=test"
+            config["dingtalk"]["secret"] = "SECtest"
+            config["dingtalk"]["send_enabled"] = True
+            config["runtime"]["primary_host"] = "OFFICE-PC"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(config=str(config_path), state_dir=str(root), require_send_ready=True)
+
+            with mock.patch.object(notifier, "current_host_name", return_value="NOTE-PC"):
+                result = notifier.execute_validate_config(args)
+
+            self.assertFalse(result["ok"])
+            self.assertIn("primary_host_mismatch", {issue["code"] for issue in result["issues"]})
 
     def test_install_schedule_reports_invalid_interval_without_exception(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1830,6 +1946,7 @@ class SendFailureTests(unittest.TestCase):
         config["dingtalk"]["group_open_conversation_id"] = "group"
         config["dingtalk"]["send_enabled"] = True
         config["notify"]["require_all_stores_before_send"] = False
+        config["runtime"]["primary_host"] = "NOTE-PC"
         config["state"]["db_path"] = str(root / "state.sqlite")
         config["state"]["result_dir"] = str(root / "runs")
         config_path = root / "config.json"
@@ -1878,7 +1995,8 @@ class SendFailureTests(unittest.TestCase):
             root = Path(temp_dir)
             config_path = self._write_config(root, root / "missing-dws.cmd")
 
-            result = notifier.execute_run(self._run_args(root, config_path, dry_run=False, send=True))
+            with mock.patch.object(notifier, "current_host_name", return_value="NOTE-PC"):
+                result = notifier.execute_run(self._run_args(root, config_path, dry_run=False, send=True))
 
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "send_failed")
@@ -1907,6 +2025,7 @@ class SendSuccessTests(unittest.TestCase):
             config["dingtalk"]["group_open_conversation_id"] = "group"
             config["dingtalk"]["send_enabled"] = True
             config["notify"]["require_all_stores_before_send"] = False
+            config["runtime"]["primary_host"] = "NOTE-PC"
             config["state"]["db_path"] = str(root / "state.sqlite")
             config["state"]["result_dir"] = str(root / "runs")
             config_path = root / "config.json"
@@ -1925,8 +2044,9 @@ class SendSuccessTests(unittest.TestCase):
                 send=True,
             )
 
-            first = notifier.execute_run(args)
-            second = notifier.execute_run(args)
+            with mock.patch.object(notifier, "current_host_name", return_value="NOTE-PC"):
+                first = notifier.execute_run(args)
+                second = notifier.execute_run(args)
 
             self.assertTrue(first["ok"])
             self.assertEqual(first["status"], "success")

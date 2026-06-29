@@ -42,6 +42,10 @@
     "interval_hours": 6,
     "command": "production-run"
   },
+  "runtime": {
+    "primary_host": "",
+    "enforce_primary_host_for_send": true
+  },
   "state": {
     "db_path": ".local-state\\account-health-notifier\\state.sqlite",
     "result_dir": ".local-state\\account-health-notifier\\runs",

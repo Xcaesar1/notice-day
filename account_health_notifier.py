@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import socket
 import subprocess
 import sys
 import tempfile
@@ -270,6 +271,10 @@ def default_config() -> dict[str, Any]:
             "task_name": DEFAULT_TASK_NAME,
             "interval_hours": 6,
             "command": "production-run",
+        },
+        "runtime": {
+            "primary_host": "",
+            "enforce_primary_host_for_send": True,
         },
         "state": {
             "db_path": str(DEFAULT_DB_PATH),
@@ -1224,6 +1229,48 @@ def issue(code: str, message: str, severity: str = "error") -> dict[str, str]:
     return {"code": code, "severity": severity, "message": message}
 
 
+class PrimaryHostError(Exception):
+    pass
+
+
+def current_host_name() -> str:
+    return clean_text(os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or socket.gethostname())
+
+
+def primary_host_policy(config: dict[str, Any]) -> dict[str, Any]:
+    runtime = config.get("runtime", {})
+    primary_host = clean_text(runtime.get("primary_host"))
+    enforce = bool(runtime.get("enforce_primary_host_for_send", True))
+    current_host = current_host_name()
+    allowed = (not enforce) or (primary_host and normalize_for_key(primary_host) == normalize_for_key(current_host))
+    return {
+        "current_host": current_host,
+        "primary_host": primary_host,
+        "enforce": enforce,
+        "allowed": allowed,
+    }
+
+
+def ensure_primary_host_allowed(config: dict[str, Any]) -> None:
+    policy = primary_host_policy(config)
+    if not policy["enforce"]:
+        return
+    if not policy["primary_host"]:
+        raise PrimaryHostError("缺少 runtime.primary_host, 无法确认当前机器是否允许真实发送。")
+    if not policy["allowed"]:
+        raise PrimaryHostError(
+            f"当前主机 {policy['current_host']} 不允许真实发送; 仅允许 {policy['primary_host']} 执行生产通知。"
+        )
+
+
+def schedule_command_name(config: dict[str, Any]) -> str:
+    return clean_text(config.get("schedule", {}).get("command") or "production-run") or "production-run"
+
+
+def should_require_source_excel_for_runtime(config: dict[str, Any]) -> bool:
+    return schedule_command_name(config) == "run"
+
+
 def validate_runtime_config(
     config_path: Path,
     config: dict[str, Any],
@@ -1293,6 +1340,18 @@ def validate_runtime_config(
             issues.append(issue("interval_hours_invalid", "interval_hours 必须大于 0"))
     except Exception:
         issues.append(issue("interval_hours_invalid", "interval_hours 必须是正整数"))
+
+    primary_host = primary_host_policy(config)
+    if require_send_ready and primary_host["enforce"]:
+        if not primary_host["primary_host"]:
+            issues.append(issue("primary_host_missing", "缺少 runtime.primary_host, 单主机生产模式无法确认唯一发送机器"))
+        elif not primary_host["allowed"]:
+            issues.append(
+                issue(
+                    "primary_host_mismatch",
+                    f"当前主机 {primary_host['current_host']} 与 runtime.primary_host={primary_host['primary_host']} 不一致",
+                )
+            )
 
     try:
         configured_run_lock_ttl_minutes(config)
@@ -1762,6 +1821,8 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
                 dry_run = False
             if not args.send and not config.get("dingtalk", {}).get("send_enabled", False):
                 dry_run = True
+            if not dry_run:
+                ensure_primary_host_allowed(config)
 
             chunks = chunked(candidates, max_items)
             title_base = notification_title()
@@ -1800,6 +1861,12 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
         status = "run_locked"
         error = str(exc)
         source = str(exc.path)
+        write_run_start(conn, run_id, started_at, source)
+    except PrimaryHostError as exc:
+        status = "host_blocked"
+        error = str(exc)
+        if not source:
+            source = "unknown"
         write_run_start(conn, run_id, started_at, source)
     except Exception as exc:
         status = "failed"
@@ -1868,6 +1935,14 @@ def execute_doctor(args: argparse.Namespace) -> dict[str, Any]:
         "robot_configured": bool(clean_text(dingtalk.get("robot_code"))),
         "group_configured": bool(clean_text(dingtalk.get("group_open_conversation_id"))),
     }
+    checks.update(
+        {
+            "current_host": current_host_name(),
+            "primary_host": primary_host_policy(config).get("primary_host", ""),
+            "enforce_primary_host_for_send": primary_host_policy(config).get("enforce", True),
+            "host_allowed_for_send": primary_host_policy(config).get("allowed", False),
+        }
+    )
     dws_status: dict[str, Any] = {}
     if method == "dws" and dws_call.is_file():
         try:
@@ -1879,7 +1954,13 @@ def execute_doctor(args: argparse.Namespace) -> dict[str, Any]:
             }
         except Exception as exc:
             dws_status = {"error": str(exc)}
-    validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=False)
+    validation = validate_runtime_config(
+        config_path,
+        config,
+        state_dir,
+        require_send_ready=False,
+        require_source_excel=should_require_source_excel_for_runtime(config),
+    )
     ok = validation["ok"]
     return {"ok": ok, "checks": checks, "validation": validation, "dws_auth_status": dws_status}
 
@@ -1893,6 +1974,7 @@ def execute_validate_config(args: argparse.Namespace) -> dict[str, Any]:
         config,
         state_dir,
         require_send_ready=bool(args.require_send_ready),
+        require_source_excel=should_require_source_excel_for_runtime(config),
     )
 
 
@@ -2446,7 +2528,13 @@ def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
     state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
     dry_run = not args.send
     if not dry_run:
-        validation = validate_runtime_config(config_path, config, state_dir, require_send_ready=True)
+        validation = validate_runtime_config(
+            config_path,
+            config,
+            state_dir,
+            require_send_ready=True,
+            require_source_excel=False,
+        )
         if not validation["ok"]:
             return {
                 "ok": False,

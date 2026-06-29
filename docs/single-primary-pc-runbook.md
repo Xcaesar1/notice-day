@@ -4,8 +4,9 @@
 
 当前项目固定采用单主机生产模式:
 
-- NotePC: 开发, 调试, 稳定性验证.
-- Office-PC: 唯一生产运行机器, 唯一钉钉真实发送机器.
+- 同一时刻只允许 1 台指定主机负责真实生产发送.
+- 这个约束必须写进 `runtime.primary_host`, 不能只靠人工记忆.
+- 在彻底迁移到 Office-PC 之前, 可以先指定当前稳定机器; 迁移时只改 `runtime.primary_host` 并迁移状态库.
 
 不要让两台 PC 同时启用真实定时发送. 多机同时运行会导致状态库不一致, 进而重复通知同一批异常.
 
@@ -60,7 +61,8 @@ python account_health_notifier.py install-schedule --json
 5. 使用 SQLite 状态库去重.
 6. 只推送新增或核心内容变化的异常.
 7. 使用 `field-block-v1` 钉钉 Markdown 模板.
-8. 无新增异常时不发群, 只写本地结果和日志.
+8. 采集前自动执行 `ziniao-cli store prepare-agent`.
+9. 无新增异常时不发群, 只写本地结果和日志.
 
 ## 禁止项
 
@@ -90,6 +92,7 @@ python account_health_notifier.py init-config --config .local-state\account-heal
 - `dingtalk.secret`
 - `dingtalk.send_enabled=true`
 - `source.store_list_path`
+- `runtime.primary_host=<Office-PC 机器名>`
 
 7. 从 NotePC 迁移 SQLite 去重库到 Office-PC:
 

@@ -4,8 +4,9 @@
 
 当前版本按单主机生产模式运行:
 
-- NotePC 用于开发, 调试和稳定性验证.
-- Office-PC 用于唯一生产定时运行和唯一钉钉真实发送.
+- 只能有 1 台被指定的生产主机负责真实钉钉发送.
+- 指定主机通过 `runtime.primary_host` 固化, 不是只靠人工约定.
+- NotePC 和 Office-PC 不能同时开启真实发送或同时安装生产任务计划.
 
 生产运行细节见 `docs/single-primary-pc-runbook.md`.
 
@@ -42,6 +43,7 @@ python account_health_notifier.py validate-config --require-send-ready --json
 - `dingtalk.webhook_url`
 - `dingtalk.secret`
 - 确认 `dingtalk.send_enabled` 是否为 `true`
+- `runtime.primary_host`: 允许真实发送的唯一机器名, 可先运行 `hostname` 查看
 
 不要把真实配置复制进仓库文件。
 
@@ -54,7 +56,7 @@ python account_health_notifier.py self-test --json
 # 生产链路 dry-run: ZClaw 全店铺采集 -> 覆盖校验 -> 去重 -> 钉钉 dry-run
 python account_health_notifier.py production-run --dry-run --json
 
-# 生产链路真实发送, 只允许在 Office-PC 执行
+# 生产链路真实发送, 只允许在 `runtime.primary_host` 指定主机执行
 python account_health_notifier.py production-run --send --json
 
 # 配置预检, 第二条会要求机器人和群配置满足真实定时通知
@@ -105,9 +107,10 @@ python account_health_notifier.py install-schedule --json
 ```
 
 启用真实定时通知前, 先运行 `production-run --dry-run`: 只有 `coverage.coverage_ok=true` 时才代表本次结果覆盖店铺清单里的全部美国站店铺。
+`production-run` 和 `zclaw-collect-stores` 会在采集前自动执行 `ziniao-cli store prepare-agent`, 避免店铺列表偶发为空。
 正式 `production-run` 会先完成 ZClaw 全店铺采集, 再强制执行店铺覆盖校验; 如果店铺清单无法读取或美国站店铺缺失, 会返回失败并且不会进入钉钉发送。
-`install-schedule` 默认安装 `production-run`; 它会执行 `--require-send-ready` 级别预检, 缺少 Webhook, Secret 或 `send_enabled=true` 时会返回 `preflight_failed`, 不会安装任务计划。
-只有 Office-PC 允许启用 `send_enabled=true` 和安装 6 小时任务计划. NotePC 保持开发验证用途, 避免重复推送.
+`install-schedule` 默认安装 `production-run`; 它会执行 `--require-send-ready` 级别预检, 缺少 Webhook, Secret, `send_enabled=true` 或 `runtime.primary_host` 不匹配时会返回 `preflight_failed`, 不会安装任务计划。
+只有 `runtime.primary_host` 指定主机允许启用 `send_enabled=true` 和安装 6 小时任务计划. 其他机器保持开发验证用途, 避免重复推送.
 
 ## 安全边界
 
