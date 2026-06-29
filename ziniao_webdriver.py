@@ -190,6 +190,17 @@ def _credential_payload(credentials: Credentials, action: str, **extra: Any) -> 
     }
 
 
+def _start_browser_payloads(store: Store) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    browser_id = clean_text(store.browser_id)
+    browser_oauth = clean_text(store.browser_oauth)
+    if browser_id:
+        payloads.append({"browserId": browser_id})
+    if browser_oauth:
+        payloads.append({"browserOauth": browser_oauth})
+    return payloads
+
+
 def get_running_info(port: int, timeout: int | float = DEFAULT_REQUEST_TIMEOUT) -> dict[str, Any]:
     payload = {"action": "getRunningInfo", "requestId": request_id("getRunningInfo")}
     return _post_json(port, payload, timeout=timeout)
@@ -344,41 +355,58 @@ def start_browser(
     request_timeout: int | float = DEFAULT_REQUEST_TIMEOUT,
     attempts: int = 2,
 ) -> StartedBrowser:
+    attempts = max(int(attempts), 1)
+    identifier_payloads = _start_browser_payloads(store)
+    if not identifier_payloads:
+        raise ZiniaoWebDriverError(f"startBrowser missing browserId/browserOauth for {store.browser_name}")
     last_payload: dict[str, Any] = {}
-    for attempt in range(max(int(attempts), 1)):
-        payload = _post_json(
-            port,
-            _credential_payload(credentials, "startBrowser", browserOauth=store.browser_oauth),
-            timeout=request_timeout,
-        )
-        last_payload = payload
-        status = _status_code(payload)
-        if status == 0:
-            debugging_port = int(payload.get("debuggingPort") or 0)
-            if debugging_port <= 0:
-                raise ZiniaoWebDriverError(
-                    f"startBrowser returned invalid debuggingPort for {store.browser_name}: {payload}"
+    last_error = ""
+    last_identifier = ""
+    for identifier_payload in identifier_payloads:
+        identifier_name = "browserId" if "browserId" in identifier_payload else "browserOauth"
+        identifier_value = clean_text(identifier_payload.get(identifier_name))
+        last_identifier = f"{identifier_name}={identifier_value}"
+        for attempt in range(attempts):
+            try:
+                payload = _post_json(
+                    port,
+                    _credential_payload(credentials, "startBrowser", **identifier_payload),
+                    timeout=request_timeout,
                 )
-            return StartedBrowser(
-                browser_oauth=store.browser_oauth,
-                debugging_port=debugging_port,
-                launcher_page=clean_text(payload.get("launcherPage")),
-                core_version=clean_text(payload.get("core_version") or payload.get("coreVersion")),
-                core_type=clean_text(payload.get("core_type") or payload.get("coreType")),
-                ip=clean_text(payload.get("ip")),
-                browser_path=clean_text(payload.get("browserPath")),
-                download_path=clean_text(payload.get("downloadPath")),
-                user_data=clean_text(payload.get("userData")),
-                duplicate=int(payload.get("duplicate") or 0),
-            )
-        if status in STATUS_RETRYABLE_START and attempt + 1 < attempts:
-            time.sleep(5)
-            continue
-        raise ZiniaoWebDriverError(
-            f"startBrowser failed store={store.browser_name} status={status}: {_response_detail(payload)}"
-        )
+            except Exception as exc:
+                last_error = clean_text(exc)
+                if attempt + 1 < attempts:
+                    time.sleep(5)
+                    continue
+                break
+            last_payload = payload
+            status = _status_code(payload)
+            if status == 0:
+                debugging_port = int(payload.get("debuggingPort") or 0)
+                if debugging_port <= 0:
+                    raise ZiniaoWebDriverError(
+                        f"startBrowser returned invalid debuggingPort for {store.browser_name} ({identifier_name}={identifier_value}): {payload}"
+                    )
+                return StartedBrowser(
+                    browser_oauth=store.browser_oauth,
+                    debugging_port=debugging_port,
+                    launcher_page=clean_text(payload.get("launcherPage")),
+                    core_version=clean_text(payload.get("core_version") or payload.get("coreVersion")),
+                    core_type=clean_text(payload.get("core_type") or payload.get("coreType")),
+                    ip=clean_text(payload.get("ip")),
+                    browser_path=clean_text(payload.get("browserPath")),
+                    download_path=clean_text(payload.get("downloadPath")),
+                    user_data=clean_text(payload.get("userData")),
+                    duplicate=int(payload.get("duplicate") or 0),
+                )
+            if status in STATUS_RETRYABLE_START and attempt + 1 < attempts:
+                time.sleep(5)
+                continue
+            last_error = f"status={status}: {_response_detail(payload)}"
+            break
+    detail = last_error or _response_detail(last_payload) or "unknown"
     raise ZiniaoWebDriverError(
-        f"startBrowser failed store={store.browser_name}: {_response_detail(last_payload)}"
+        f"startBrowser failed store={store.browser_name} ({last_identifier}): {detail}"
     )
 
 
@@ -388,9 +416,13 @@ def stop_browser(
     store: Store,
     request_timeout: int | float = DEFAULT_STOP_TIMEOUT,
 ) -> dict[str, Any]:
+    identifier_payloads = _start_browser_payloads(store)
+    if not identifier_payloads:
+        raise ZiniaoWebDriverError(f"stopBrowser missing browserId/browserOauth for {store.browser_name}")
+    identifier_payload = identifier_payloads[0]
     payload = _post_json(
         port,
-        _credential_payload(credentials, "stopBrowser", browserOauth=store.browser_oauth),
+        _credential_payload(credentials, "stopBrowser", **identifier_payload),
         timeout=request_timeout,
     )
     status = _status_code(payload)

@@ -2095,6 +2095,56 @@ class ZiniaoWebdriverTests(unittest.TestCase):
 
         self.assertEqual([item.browser_name for item in selected], ["BYF"])
 
+    def test_start_browser_payloads_prefer_browser_id_then_browser_oauth(self) -> None:
+        store = ziniao_webdriver.Store(
+            browser_oauth="oauth-1",
+            browser_name="Hangoro",
+            site_id="1",
+            platform_id="1",
+            platform_name="Amazon-US",
+            browser_id="27128487964502",
+        )
+
+        payloads = ziniao_webdriver._start_browser_payloads(store)
+
+        self.assertEqual(
+            payloads,
+            [
+                {"browserId": "27128487964502"},
+                {"browserOauth": "oauth-1"},
+            ],
+        )
+
+    def test_start_browser_uses_browser_id_first(self) -> None:
+        store = ziniao_webdriver.Store(
+            browser_oauth="oauth-1",
+            browser_name="Hangoro",
+            site_id="1",
+            platform_id="1",
+            platform_name="Amazon-US",
+            browser_id="27128487964502",
+        )
+        credentials = ziniao_webdriver.Credentials("company", "user", "pass")
+        calls: list[dict[str, object]] = []
+
+        def fake_post_json(port: int, payload: dict[str, object], timeout: int | float = 30) -> dict[str, object]:
+            calls.append(payload)
+            return {
+                "statusCode": 0,
+                "debuggingPort": 44610,
+                "launcherPage": "https://sellercentral.amazon.com/home",
+                "core_version": "138.1.2.86",
+                "core_type": 0,
+            }
+
+        with mock.patch.object(ziniao_webdriver, "_post_json", side_effect=fake_post_json):
+            started = ziniao_webdriver.start_browser(9515, credentials, store, request_timeout=30, attempts=1)
+
+        self.assertEqual(started.debugging_port, 44610)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["browserId"], "27128487964502")
+        self.assertNotIn("browserOauth", calls[0])
+
 
 class RuntimeValidationTests(unittest.TestCase):
     def test_validate_runtime_config_requires_webdriver_settings_for_production_run(self) -> None:
