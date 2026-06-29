@@ -2,122 +2,173 @@
 
 ## 结论
 
-当前项目固定采用单主机生产模式:
+生产只允许一台机器负责真实采集和真实钉钉发送。
 
-- 同一时刻只允许 1 台指定主机负责真实生产发送.
-- 这个约束必须写进 `runtime.primary_host`, 不能只靠人工记忆.
-- 在彻底迁移到 Office-PC 之前, 可以先指定当前稳定机器; 迁移时只改 `runtime.primary_host` 并迁移状态库.
+当前推荐：
 
-不要让两台 PC 同时启用真实定时发送. 多机同时运行会导致状态库不一致, 进而重复通知同一批异常.
+- 开发与排障：NotePC
+- 正式生产：Office-PC
 
-## 生产运行策略
+真实生产链路推荐使用 `collector.backend=webdriver`。
 
-生产任务在 Office-PC 上每 6 小时运行一次:
+## 为什么必须单主机
 
-```powershell
-Set-Location Q:\notice-day
-python account_health_notifier.py production-run --send --json
+如果两台机器同时运行真实任务，会出现：
+
+- 同一批异常重复推送
+- SQLite 去重状态不一致
+- 定时任务互相覆盖定位
+- 真实发送责任边界不清楚
+
+所以必须在配置里固定：
+
+```json
+{
+  "runtime": {
+    "primary_host": "OFFICE-PC",
+    "enforce_primary_host_for_send": true
+  }
+}
 ```
 
-正式运行前必须通过:
+## Office-PC 正式配置
+
+### 1. 准备目录
+
+建议：
+
+- 项目目录：`E:\notice-day`
+- 本地状态目录：`E:\notice-day\.local-state\account-health-notifier`
+- 店铺清单：`E:\notice-day\data\store-list.xlsx`
+
+### 2. 安装依赖
+
+```powershell
+Set-Location E:\notice-day
+python -m pip install -r requirements.txt
+npm install -g @ziniao-open/cli
+ziniao-cli --version
+```
+
+### 3. 初始化配置
+
+```powershell
+python account_health_notifier.py init-config --config .local-state\account-health-notifier\config.json
+```
+
+### 4. 配置 collector=webdriver
+
+本地 `config.json` 至少填写：
+
+```json
+{
+  "collector": {
+    "backend": "webdriver"
+  },
+  "ziniao_webdriver": {
+    "client_path": "D:\\ziniao\\ziniao.exe",
+    "port": 9515,
+    "company": "你的企业名",
+    "username": "你的紫鸟账号",
+    "password": "",
+    "password_env": "ZINIAO_WEBDRIVER_PASSWORD"
+  },
+  "dingtalk": {
+    "method": "webhook",
+    "webhook_url": "你的 webhook",
+    "secret": "你的 secret",
+    "send_enabled": true
+  },
+  "runtime": {
+    "primary_host": "OFFICE-PC",
+    "enforce_primary_host_for_send": true
+  }
+}
+```
+
+推荐把紫鸟密码写进环境变量：
+
+```powershell
+$env:ZINIAO_WEBDRIVER_PASSWORD = "你的密码"
+```
+
+## 迁移旧去重状态
+
+如果 NotePC 上已经跑过真实通知，要把旧状态库迁移到 Office-PC：
+
+```text
+.local-state\account-health-notifier\state.sqlite
+```
+
+否则 Office-PC 第一次会把历史未解决异常重新当作新增推送。
+
+## 上线前检查
+
+先跑：
 
 ```powershell
 python account_health_notifier.py doctor --json
+python account_health_notifier.py validate-config --json
 python account_health_notifier.py validate-config --require-send-ready --json
 python account_health_notifier.py self-test --json
 ```
 
-安装 Windows 任务计划前先 dry-run:
+然后做一次真实采集 dry-run：
+
+```powershell
+python account_health_notifier.py production-run --backend webdriver --dry-run --json
+```
+
+如果只想先做小验证：
+
+```powershell
+python account_health_notifier.py webdriver-collect-stores --stores BYF --limit 1 --json
+```
+
+## 安装 6 小时任务计划
 
 ```powershell
 python account_health_notifier.py install-schedule --dry-run --json
 python account_health_notifier.py install-schedule --json
 ```
 
-## 采集范围
-
-默认日期范围是当月 1 日到当天:
-
-- `2026-06-25` 运行时采集 `2026-06-01` 到 `2026-06-25`.
-- `2026-07-25` 运行时采集 `2026-07-01` 到 `2026-07-25`.
-
-不要在定时任务里写死月份日期. 只有临时补数或排障时才手动传 `--start-date` 和 `--end-date`.
-
-## 耗时预估
-
-已验证的 14 个美国站店铺串行采集耗时:
-
-- 快速轮: 约 3.65 分钟.
-- 慢速轮: 约 5.75 分钟.
-
-生产设计按 10-20 分钟容错. 当前 `run_lock_ttl_minutes` 为 240, 足够避免重复任务重叠.
-
-## 固定流程
-
-1. 读取店铺清单, 只处理美国站.
-2. 单店串行打开和采集, 不启用多店铺并发启动.
-3. 日期范围使用当月 1 日到当天.
-4. 解析未解决账号状况异常里的 ASIN/SKU.
-5. 使用 SQLite 状态库去重.
-6. 只推送新增或核心内容变化的异常.
-7. 使用 `field-block-v1` 钉钉 Markdown 模板.
-8. 采集前自动执行 `ziniao-cli store prepare-agent`.
-9. 无新增异常时不发群, 只写本地结果和日志.
-
-## 禁止项
-
-- 不要同时在 NotePC 和 Office-PC 启用 `send_enabled=true`.
-- 不要同时安装两台机器的 6 小时任务计划.
-- 不要用 CDP daemon 作为正式采集主链路. 实测它会干扰紫鸟 `store open`.
-- 不要并发调用多个 `ziniao-cli store open`. 实测会让 ZClaw Bridge 短暂不可用.
-- 不要提交 `.local-state`, webhook, secret, SQLite 状态库或运行结果.
-
-## 迁移到 Office-PC
-
-在 Office-PC 上执行:
-
-1. 拉取仓库到 `Q:\notice-day`.
-2. 安装 Python 依赖: `pip install -r requirements.txt`.
-3. 安装并配置 `ziniao-cli`.
-4. 登录紫鸟客户端, 确认能打开 14 个美国站店铺.
-5. 初始化本机配置:
+任务计划最终执行的是：
 
 ```powershell
-python account_health_notifier.py init-config --config .local-state\account-health-notifier\config.json
+python account_health_notifier.py production-run --config .local-state\account-health-notifier\config.json
 ```
 
-6. 填写 `.local-state\account-health-notifier\config.json`:
+## 运行边界
 
-- `dingtalk.webhook_url`
-- `dingtalk.secret`
-- `dingtalk.send_enabled=true`
-- `source.store_list_path`
-- `runtime.primary_host=<Office-PC 机器名>`
+- 默认只采集“当月 1 日到今天”
+- 只处理美国站
+- 失败店铺会写入本地结果，但本轮不会误报“全部正常”
+- 没有新增异常时不发群
 
-7. 从 NotePC 迁移 SQLite 去重库到 Office-PC:
+## 故障定位
 
-```text
-.local-state\account-health-notifier\state.sqlite
-```
+### validate-config 报 webdriver 缺项
 
-如果不迁移该文件, Office-PC 第一次运行会把历史异常当成新增重新推送.
+检查：
 
-8. 在 Office-PC 上做 dry-run 和真实测试:
+- `collector.backend=webdriver`
+- `ziniao_webdriver.client_path`
+- `ziniao_webdriver.company`
+- `ziniao_webdriver.username`
+- `ziniao_webdriver.password` 或 `password_env`
 
-```powershell
-python account_health_notifier.py production-run --dry-run --json
-python account_health_notifier.py send-test --send --json
-```
+### WebDriver 端口起不来
 
-9. 确认无误后, 只在 Office-PC 安装任务计划.
+先确认：
 
-10. NotePC 保留 `send_enabled=false`, 不安装生产任务计划.
+- `D:\ziniao\ziniao.exe` 路径正确
+- 9515 端口未被占用
+- 没有残留的普通紫鸟主进程干扰
 
-## 验收标准
+### startBrowser 成功但页面是 about:blank
 
-- Office-PC 每 6 小时运行一次.
-- 每轮能覆盖 14 个美国站店铺.
-- 当前月无新增异常时不发群.
-- 有新增或变化时, 钉钉只收到最新异常.
-- 消息格式符合 `docs/dingtalk-markdown-template.md`.
-- 失败店铺写入本地结果, 不阻断后续店铺采集; 但本轮不会发钉钉, 避免漏店铺时误报"无新增".
+这是已知场景。当前实现会自动继续通过 CDP 导航到 Seller Central，再进入账户状况采集。
+
+### Amazon 出现登录 / 切换账户 / 二次验证
+
+当前实现会把这类页面识别成“业务未就绪”，在结果里返回可读错误。正式无人值守前，先确保该批店铺在 Office-PC 上已经具备稳定登录态。

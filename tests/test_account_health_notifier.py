@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 import account_health_notifier as notifier  # noqa: E402
 import cdp_account_health  # noqa: E402
 import ziniao_cdp  # noqa: E402
+import ziniao_webdriver  # noqa: E402
 import zclaw_account_health  # noqa: E402
 
 
@@ -2062,6 +2063,122 @@ class SendSuccessTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(notified_count, 1)
             self.assertEqual(sent_attempts, 1)
+
+
+class ZiniaoWebdriverTests(unittest.TestCase):
+    def test_filter_us_amazon_stores_uses_site_and_platform(self) -> None:
+        stores = [
+            ziniao_webdriver.Store(
+                browser_oauth="us-amazon",
+                browser_name="BYF",
+                site_id="1",
+                platform_id="1",
+                platform_name="亚马逊-美国",
+            ),
+            ziniao_webdriver.Store(
+                browser_oauth="ca-amazon",
+                browser_name="BYF-CA",
+                site_id="2",
+                platform_id="1",
+                platform_name="亚马逊-加拿大",
+            ),
+            ziniao_webdriver.Store(
+                browser_oauth="us-tiktok",
+                browser_name="TikTok Shop 1",
+                site_id="1",
+                platform_id="2",
+                platform_name="TikTokShop-美国-本土",
+            ),
+        ]
+
+        selected = ziniao_webdriver.filter_us_amazon_stores(stores)
+
+        self.assertEqual([item.browser_name for item in selected], ["BYF"])
+
+
+class RuntimeValidationTests(unittest.TestCase):
+    def test_validate_runtime_config_requires_webdriver_settings_for_production_run(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["collector"]["backend"] = "webdriver"
+            config["notify"]["require_all_stores_before_send"] = False
+            config["ziniao_webdriver"]["company"] = "test-company"
+            config["ziniao_webdriver"]["username"] = "tester"
+            config["source"]["store_list_path"] = str(root / "stores.xlsx")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+            result = notifier.validate_runtime_config(
+                config_path,
+                config,
+                root,
+                require_send_ready=False,
+                require_source_excel=False,
+                require_collector_ready=True,
+            )
+
+        issue_codes = {item["code"] for item in result["issues"]}
+        self.assertIn("webdriver_client_path_missing", issue_codes)
+        self.assertIn("webdriver_password_missing", issue_codes)
+
+
+class ProductionRunBackendTests(unittest.TestCase):
+    def test_production_run_routes_to_webdriver_backend(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["collector"]["backend"] = "webdriver"
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                start_date="2026-06-01",
+                end_date="2026-06-29",
+                categories="safe",
+                stores="BYF",
+                limit=1,
+                backend="",
+                site="美国",
+                page_size=25,
+                max_pages=2,
+                keep_open=False,
+                output_dir=str(root / "runs"),
+                dry_run=True,
+                send=False,
+            )
+            collection = {
+                "ok": True,
+                "status": "success",
+                "run_id": "collect-1",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-29",
+                "target_site": "美国",
+                "target_count": 1,
+                "row_count": 1,
+                "artifact": str(root / "collect.xlsx"),
+                "json_artifact": str(root / "collect.json"),
+            }
+            notification = {
+                "ok": True,
+                "status": "dry_run",
+                "run_id": "notify-1",
+                "artifact": str(root / "notify.xlsx"),
+                "total_items": 1,
+                "notify_candidates": 1,
+                "sent_items": 0,
+                "error": "",
+                "coverage": {},
+            }
+            with mock.patch.object(notifier, "execute_webdriver_collect_stores", return_value=collection) as webdriver_collect:
+                with mock.patch.object(notifier, "execute_run", return_value=notification) as execute_run:
+                    result = notifier.execute_production_run(args)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["backend"], "webdriver")
+        webdriver_collect.assert_called_once()
+        execute_run.assert_called_once()
 
 
 if __name__ == "__main__":

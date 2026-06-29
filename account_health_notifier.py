@@ -27,6 +27,7 @@ import html
 import xml.etree.ElementTree as ET
 
 import cdp_account_health
+import ziniao_webdriver
 import ziniao_cdp
 import zclaw_account_health
 
@@ -229,6 +230,9 @@ def run_id_text() -> str:
 
 def default_config() -> dict[str, Any]:
     return {
+        "collector": {
+            "backend": "zclaw",
+        },
         "source": {
             "type": "excel_latest",
             "excel_path": "",
@@ -236,6 +240,20 @@ def default_config() -> dict[str, Any]:
             "store_list_path": str(DEFAULT_STORE_LIST),
             "site": SITE_US,
             "max_excel_age_hours": 30,
+        },
+        "ziniao_webdriver": {
+            "client_path": "",
+            "port": 9515,
+            "company": "",
+            "username": "",
+            "password": "",
+            "password_env": "ZINIAO_WEBDRIVER_PASSWORD",
+            "request_timeout_seconds": 30,
+            "startup_timeout_seconds": 60,
+            "update_core_timeout_seconds": 300,
+            "update_core_poll_seconds": 2,
+            "browser_ready_timeout_seconds": 60,
+            "navigation_wait_seconds": 3,
         },
         "ziniao_cdp": {
             "port": 0,
@@ -1271,14 +1289,54 @@ def should_require_source_excel_for_runtime(config: dict[str, Any]) -> bool:
     return schedule_command_name(config) == "run"
 
 
+def collector_backend_name(config: dict[str, Any], override: str = "") -> str:
+    backend = clean_text(override or config.get("collector", {}).get("backend") or "webdriver").lower()
+    return backend or "webdriver"
+
+
+def should_require_collector_for_runtime(config: dict[str, Any]) -> bool:
+    return schedule_command_name(config) == "production-run"
+
+
 def validate_runtime_config(
     config_path: Path,
     config: dict[str, Any],
     state_dir: Path,
     require_send_ready: bool = False,
     require_source_excel: bool = True,
+    require_collector_ready: bool = False,
 ) -> dict[str, Any]:
     issues: list[dict[str, str]] = []
+    collector_backend = collector_backend_name(config)
+    if collector_backend not in {"webdriver", "zclaw"}:
+        issues.append(issue("collector_backend_invalid", "collector.backend must be webdriver or zclaw"))
+    if require_collector_ready and collector_backend == "webdriver":
+        webdriver_config = config.get("ziniao_webdriver", {})
+        client_path_text = clean_text(webdriver_config.get("client_path"))
+        client_path = Path(client_path_text or "")
+        if not client_path_text:
+            issues.append(issue("webdriver_client_path_missing", "ziniao_webdriver.client_path is required"))
+        elif not client_path.is_file():
+            issues.append(issue("webdriver_client_path_missing", f"WebDriver client not found: {client_path}"))
+        try:
+            if int(webdriver_config.get("port") or 0) <= 0:
+                issues.append(issue("webdriver_port_invalid", "ziniao_webdriver.port must be > 0"))
+        except Exception:
+            issues.append(issue("webdriver_port_invalid", "ziniao_webdriver.port must be an integer"))
+        if not clean_text(webdriver_config.get("company")):
+            issues.append(issue("webdriver_company_missing", "ziniao_webdriver.company is required"))
+        if not clean_text(webdriver_config.get("username")):
+            issues.append(issue("webdriver_username_missing", "ziniao_webdriver.username is required"))
+        password = clean_text(webdriver_config.get("password"))
+        password_env = clean_text(webdriver_config.get("password_env"))
+        env_password = clean_text(os.environ.get(password_env)) if password_env else ""
+        if not password and not env_password:
+            issues.append(
+                issue(
+                    "webdriver_password_missing",
+                    "ziniao_webdriver.password is required, or ziniao_webdriver.password_env must point to an existing environment variable",
+                )
+            )
     if not config_path.is_file():
         issues.append(issue("config_missing", f"配置文件不存在: {config_path}"))
 
@@ -1960,6 +2018,7 @@ def execute_doctor(args: argparse.Namespace) -> dict[str, Any]:
         state_dir,
         require_send_ready=False,
         require_source_excel=should_require_source_excel_for_runtime(config),
+        require_collector_ready=should_require_collector_for_runtime(config),
     )
     ok = validation["ok"]
     return {"ok": ok, "checks": checks, "validation": validation, "dws_auth_status": dws_status}
@@ -1975,6 +2034,7 @@ def execute_validate_config(args: argparse.Namespace) -> dict[str, Any]:
         state_dir,
         require_send_ready=bool(args.require_send_ready),
         require_source_excel=should_require_source_excel_for_runtime(config),
+        require_collector_ready=should_require_collector_for_runtime(config),
     )
 
 
@@ -2435,9 +2495,135 @@ def execute_zclaw_collect_stores(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def execute_webdriver_collect_stores(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    start_date = clean_text(args.start_date)
+    end_date = clean_text(args.end_date)
+    if not start_date or not end_date:
+        start_date, end_date = ziniao_webdriver.current_month_range()
+    source_config = config.get("source", {})
+    target_site = clean_text(args.site) or clean_text(source_config.get("site")) or SITE_US
+    categories = ziniao_webdriver.selected_categories(args.categories)
+    webdriver_args = ziniao_webdriver.build_args(config, args)
+    try:
+        collection = ziniao_webdriver.collect_visible_account_health(
+            client_path=webdriver_args["client_path"],
+            webdriver_port=webdriver_args["port"],
+            credentials=webdriver_args["credentials"],
+            start_date=start_date,
+            end_date=end_date,
+            categories=categories,
+            stores=args.stores,
+            limit=int(args.limit or 0),
+            page_size=webdriver_args["page_size"],
+            max_pages=webdriver_args["max_pages"],
+            close_after=not args.keep_open,
+            startup_timeout=webdriver_args["startup_timeout"],
+            update_core_timeout=webdriver_args["update_core_timeout"],
+            update_core_poll_seconds=webdriver_args["update_core_poll_seconds"],
+            request_timeout=webdriver_args["request_timeout"],
+            browser_ready_timeout=webdriver_args["browser_ready_timeout"],
+            navigation_wait_seconds=webdriver_args["navigation_wait_seconds"],
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "collect_failed",
+            "backend": "webdriver",
+            "run_id": run_id_text(),
+            "start_date": start_date,
+            "end_date": end_date,
+            "target_site": target_site,
+            "row_count": 0,
+            "target_count": 0,
+            "artifact": "",
+            "json_artifact": "",
+            "target_results": [],
+            "items_preview": [],
+            "error": clean_text(exc),
+        }
+
+    run_id = run_id_text()
+    target_results = [sanitized_target_result(result) for result in collection.get("target_results", [])]
+    source_file = "webdriver-stores"
+    items = [
+        impact_item_from_cdp_row(row, source_file)
+        for row in collection.get("rows", [])
+        if site_matches(clean_text(row.get("site")), target_site)
+    ]
+    item_rows = [item.to_row(run_id, "webdriver_collected") for item in items]
+    target_rows = cdp_target_result_rows(run_id, target_results)
+
+    expected_stores = [clean_text(store) for store in collection.get("selected_stores", []) if clean_text(store)]
+    summary = cdp_open_summary(
+        items,
+        expected_stores=expected_stores,
+        target_results=target_results,
+        target_site=target_site,
+        store_list_path="ziniao-webdriver getBrowserList",
+        store_list_error="",
+    )
+    target_failures = [result for result in target_results if not result.get("ok")]
+    if not target_results:
+        status = "no_targets"
+    elif target_failures:
+        status = "partial_failed"
+    elif summary.get("missing_stores"):
+        status = "partial"
+    else:
+        status = "success"
+    ok = bool(target_results) and not target_failures and not summary.get("missing_stores")
+
+    result_dir = Path(args.output_dir or config.get("state", {}).get("result_dir") or DEFAULT_STATE_DIR / "runs")
+    artifact = result_dir / f"account-health-webdriver-stores-{run_id}.xlsx"
+    write_collect_open_xlsx(artifact, item_rows, target_rows, summary)
+    json_artifact = result_dir / f"account-health-webdriver-stores-{run_id}.json"
+    json_artifact.parent.mkdir(parents=True, exist_ok=True)
+    json_payload = {
+        "run_id": run_id,
+        "status": status,
+        "backend": "webdriver",
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_site": target_site,
+        "row_count": len(items),
+        "target_count": len(target_results),
+        "target_results": target_results,
+        "missing_stores": summary.get("missing_stores", []),
+        "opened_stores": summary.get("opened_stores", []),
+        "rows": [item.to_row(run_id, "webdriver_collected") for item in items],
+    }
+    json_artifact.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    payload = {
+        "ok": ok,
+        "status": status,
+        "backend": "webdriver",
+        "run_id": run_id,
+        "start_date": start_date,
+        "end_date": end_date,
+        "target_site": target_site,
+        "row_count": len(items),
+        "target_count": len(target_results),
+        "artifact": str(artifact),
+        "json_artifact": str(json_artifact),
+        "target_results": target_results,
+        **summary,
+    }
+    if args.include_items:
+        payload["items"] = [item.to_row(run_id, "webdriver_collected") for item in items]
+    else:
+        payload["items_preview"] = [item.to_row(run_id, "webdriver_collected") for item in items[:20]]
+    return payload
+
+
 def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(getattr(args, "config", str(DEFAULT_CONFIG_PATH)))
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    backend = collector_backend_name(config, getattr(args, "backend", ""))
     collect_args = argparse.Namespace(
-        config=getattr(args, "config", str(DEFAULT_CONFIG_PATH)),
+        config=str(config_path),
         state_dir=getattr(args, "state_dir", ""),
         start_date=getattr(args, "start_date", ""),
         end_date=getattr(args, "end_date", ""),
@@ -2454,7 +2640,33 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
         output_dir=getattr(args, "output_dir", ""),
         include_items=False,
     )
-    collection = execute_zclaw_collect_stores(collect_args)
+    if backend == "webdriver":
+        collection = execute_webdriver_collect_stores(collect_args)
+    elif backend == "zclaw":
+        collection = execute_zclaw_collect_stores(collect_args)
+    else:
+        return {
+            "ok": False,
+            "status": "collect_failed",
+            "collection_status": "invalid_backend",
+            "notification_status": "skipped",
+            "backend": backend,
+            "collection_run_id": "",
+            "start_date": "",
+            "end_date": "",
+            "target_site": "",
+            "target_count": 0,
+            "row_count": 0,
+            "source_excel": "",
+            "collect_artifact": "",
+            "collect_json_artifact": "",
+            "notify_artifact": "",
+            "total_items": 0,
+            "notify_candidates": 0,
+            "sent_items": 0,
+            "error": f"Unsupported collector backend: {backend}",
+            "collection": {},
+        }
     source_excel = clean_text(collection.get("artifact"))
     if not collection.get("ok") or not source_excel:
         return {
@@ -2462,6 +2674,7 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
             "status": "collect_failed",
             "collection_status": collection.get("status", "unknown"),
             "notification_status": "skipped",
+            "backend": backend,
             "collection_run_id": collection.get("run_id", ""),
             "start_date": collection.get("start_date", ""),
             "end_date": collection.get("end_date", ""),
@@ -2499,6 +2712,7 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "ok": ok,
         "status": status,
+        "backend": backend,
         "collection_status": collection.get("status", "unknown"),
         "notification_status": notification_status,
         "collection_run_id": collection.get("run_id", ""),
@@ -2534,6 +2748,7 @@ def execute_send_test(args: argparse.Namespace) -> dict[str, Any]:
             state_dir,
             require_send_ready=True,
             require_source_excel=False,
+            require_collector_ready=False,
         )
         if not validation["ok"]:
             return {
@@ -2602,6 +2817,7 @@ def execute_install_schedule(args: argparse.Namespace) -> dict[str, Any]:
         state_dir,
         require_send_ready=True,
         require_source_excel=schedule_command == "run",
+        require_collector_ready=schedule_command == "production-run",
     )
     if not validation["ok"] and not getattr(args, "skip_preflight", False):
         return {
@@ -2898,19 +3114,32 @@ def build_parser() -> argparse.ArgumentParser:
     zclaw_collect.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
     zclaw_collect.set_defaults(func=execute_zclaw_collect_stores)
 
-    production_run = sub.add_parser("production-run", help="Collect all stores with ZClaw, dedupe, and send DingTalk")
+    webdriver_collect = sub.add_parser("webdriver-collect-stores", help="Collect account health issues through official Ziniao WebDriver + CDP")
+    add_common(webdriver_collect)
+    webdriver_collect.add_argument("--start-date", default="", help="start date YYYY-MM-DD, defaults to current month start")
+    webdriver_collect.add_argument("--end-date", default="", help="end date YYYY-MM-DD, defaults to today")
+    webdriver_collect.add_argument("--categories", default="all", help="all or comma-separated policy keys")
+    webdriver_collect.add_argument("--stores", default="", help="comma-separated store names or browserOauth values; defaults to all Amazon US stores")
+    webdriver_collect.add_argument("--limit", type=int, default=0, help="limit selected stores for smoke testing")
+    webdriver_collect.add_argument("--site", default="", help="target site")
+    webdriver_collect.add_argument("--page-size", type=int, default=0, help="API page size")
+    webdriver_collect.add_argument("--max-pages", type=int, default=0, help="maximum pages per category")
+    webdriver_collect.add_argument("--keep-open", action="store_true", help="do not close store windows after collection")
+    webdriver_collect.add_argument("--output-dir", default="", help="output directory")
+    webdriver_collect.add_argument("--include-items", action="store_true", help="include full item rows in JSON output")
+    webdriver_collect.set_defaults(func=execute_webdriver_collect_stores)
+
+    production_run = sub.add_parser("production-run", help="Collect all stores, dedupe, and send DingTalk")
     add_common(production_run)
     production_run.add_argument("--start-date", default="", help="start date YYYY-MM-DD, defaults to current month start")
     production_run.add_argument("--end-date", default="", help="end date YYYY-MM-DD, defaults to today")
     production_run.add_argument("--categories", default="all", help="all or comma-separated policy keys")
     production_run.add_argument("--stores", default="", help="comma-separated store names or store IDs; defaults to all visible Amazon US stores")
     production_run.add_argument("--limit", type=int, default=0, help="limit selected stores for smoke testing")
+    production_run.add_argument("--backend", choices=["webdriver", "zclaw"], default="", help="override collector backend")
     production_run.add_argument("--site", default="", help="target site")
     production_run.add_argument("--page-size", type=int, default=0, help="API page size")
     production_run.add_argument("--max-pages", type=int, default=0, help="maximum pages per category")
-    production_run.add_argument("--open-timeout", type=int, default=0, help="store open timeout seconds")
-    production_run.add_argument("--nav-timeout", type=int, default=0, help="page navigation timeout seconds")
-    production_run.add_argument("--exec-timeout", type=int, default=0, help="page script timeout seconds")
     production_run.add_argument("--keep-open", action="store_true", help="do not close store windows after collection")
     production_run.add_argument("--output-dir", default="", help="collection output directory")
     production_run.add_argument("--dry-run", action="store_true", help="do not send DingTalk messages")

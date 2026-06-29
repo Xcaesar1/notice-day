@@ -1,11 +1,28 @@
 {
+  "collector": {
+    "backend": "webdriver"
+  },
   "source": {
     "type": "excel_latest",
     "excel_path": "",
-    "excel_dir": "C:\\Users\\god\\Desktop\\RPA下载结果\\账户状况异常明细",
-    "store_list_path": "F:\\店铺清单.xlsx",
+    "excel_dir": "C:\\Users\\admin\\Desktop\\AmazonAccountHealthResults",
+    "store_list_path": "E:\\notice-day\\data\\store-list.xlsx",
     "site": "美国",
     "max_excel_age_hours": 30
+  },
+  "ziniao_webdriver": {
+    "client_path": "D:\\ziniao\\ziniao.exe",
+    "port": 9515,
+    "company": "深圳市沃狮科技有限公司",
+    "username": "IT-AI01",
+    "password": "",
+    "password_env": "ZINIAO_WEBDRIVER_PASSWORD",
+    "request_timeout_seconds": 30,
+    "startup_timeout_seconds": 60,
+    "update_core_timeout_seconds": 300,
+    "update_core_poll_seconds": 2,
+    "browser_ready_timeout_seconds": 60,
+    "navigation_wait_seconds": 3
   },
   "ziniao_cdp": {
     "port": 0,
@@ -43,7 +60,7 @@
     "command": "production-run"
   },
   "runtime": {
-    "primary_host": "",
+    "primary_host": "OFFICE-PC",
     "enforce_primary_host_for_send": true
   },
   "state": {
