@@ -582,6 +582,16 @@ def _is_seller_business_page(snapshot: dict[str, Any]) -> bool:
     return True
 
 
+def _snapshot_ready_state(snapshot: dict[str, Any]) -> str:
+    return clean_text(snapshot.get("ready_state") or snapshot.get("readyState"))
+
+
+def _snapshot_business_ready(snapshot: dict[str, Any]) -> bool:
+    if "business_ready" in snapshot:
+        return bool(snapshot.get("business_ready"))
+    return _snapshot_ready_state(snapshot) == "complete" and _is_seller_business_page(snapshot)
+
+
 def _looks_like_login_or_verification(snapshot: dict[str, Any]) -> bool:
     url = clean_text(snapshot.get("url")).lower()
     text = clean_text(snapshot.get("body_sample"))
@@ -705,7 +715,7 @@ def wait_for_seller_page_with_verification(
             current = wait_for_page_target(current.port, timeout=10, preferred_target_id=current.id)
             snapshot = probe_target(current, text_limit=2000)
             last_snapshot = snapshot
-            if snapshot.get("readyState") == "complete" and _is_seller_business_page(snapshot):
+            if _snapshot_business_ready(snapshot):
                 return current, snapshot
             if _looks_like_account_switcher(snapshot):
                 click_result = click_existing_account_if_present(current, timeout=10)
@@ -784,7 +794,7 @@ def collect_store_account_health(
                 timeout=max(browser_ready_timeout, 90),
                 navigation_wait_seconds=navigation_wait_seconds,
             )
-        elif page_snapshot.get("readyState") != "complete" or not _is_seller_business_page(page_snapshot):
+        elif not _snapshot_business_ready(page_snapshot):
             target, page_snapshot = wait_for_seller_page_with_verification(
                 target,
                 timeout=max(browser_ready_timeout, 45),

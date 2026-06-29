@@ -2122,6 +2122,16 @@ class ZiniaoWebdriverTests(unittest.TestCase):
 
         self.assertEqual(target.id, "seller")
 
+    def test_snapshot_business_ready_supports_probe_safe_dict_shape(self) -> None:
+        snapshot = {
+            "url": "https://sellercentral.amazon.com/performance/dashboard",
+            "ready_state": "complete",
+            "business_ready": True,
+            "body_sample": "账户状况 良好",
+        }
+
+        self.assertTrue(ziniao_webdriver._snapshot_business_ready(snapshot))
+
     def test_start_browser_payloads_prefer_browser_id_then_browser_oauth(self) -> None:
         store = ziniao_webdriver.Store(
             browser_oauth="oauth-1",
