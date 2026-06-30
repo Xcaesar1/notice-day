@@ -3466,6 +3466,23 @@ def print_result(payload: dict[str, Any], as_json: bool) -> None:
             print(f"{key}: {value}")
 
 
+def command_state_dir(args: argparse.Namespace) -> Path:
+    state_dir = clean_text(getattr(args, "state_dir", ""))
+    if state_dir:
+        return Path(state_dir)
+    config_path = Path(getattr(args, "config", str(DEFAULT_CONFIG_PATH)))
+    return config_path.parent if config_path.parent else DEFAULT_STATE_DIR
+
+
+def write_last_command_result(command_name: str, state_dir: Path, payload: dict[str, Any]) -> str:
+    if clean_text(command_name) != "production-run":
+        return ""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    report_path = state_dir / "last-production-run.json"
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return str(report_path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Amazon account health ASIN/SKU DingTalk notifier.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="配置文件路径")
@@ -3695,12 +3712,21 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print_result({"ok": False, "error": str(exc)}, args.json)
             return 1
+    state_dir = command_state_dir(args)
     try:
         payload = args.func(args)
+        last_report_path = write_last_command_result(args.command, state_dir, payload)
+        if last_report_path:
+            payload = dict(payload)
+            payload["last_report_path"] = last_report_path
         print_result(payload, args.json)
         return 0 if payload.get("ok") else 1
     except Exception as exc:
-        print_result({"ok": False, "error": str(exc)}, args.json)
+        error_payload = {"ok": False, "error": str(exc)}
+        last_report_path = write_last_command_result(args.command, state_dir, error_payload)
+        if last_report_path:
+            error_payload["last_report_path"] = last_report_path
+        print_result(error_payload, args.json)
         return 1
 
 

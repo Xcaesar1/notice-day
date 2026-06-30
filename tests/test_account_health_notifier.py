@@ -1889,6 +1889,37 @@ class ConfigValidationTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("source_max_excel_age_hours_invalid", {issue["code"] for issue in result["issues"]})
 
+
+class MainEntryTests(ConfigValidationTests):
+    def test_main_writes_last_production_run_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_dir = root / "state"
+            state_dir.mkdir()
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            payload = {"ok": True, "status": "no_new_items", "backend": "webdriver"}
+
+            with mock.patch.object(notifier, "execute_production_run", return_value=payload):
+                with mock.patch.object(notifier, "print_result"):
+                    exit_code = notifier.main(
+                        [
+                            "--config",
+                            str(config_path),
+                            "--state-dir",
+                            str(state_dir),
+                            "--json",
+                            "production-run",
+                        ]
+                    )
+
+            self.assertEqual(exit_code, 0)
+            report_path = state_dir / "last-production-run.json"
+            self.assertTrue(report_path.is_file())
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["status"], "no_new_items")
+
     def test_validate_config_reports_invalid_run_lock_ttl(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
