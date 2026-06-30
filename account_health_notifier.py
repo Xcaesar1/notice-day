@@ -18,7 +18,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib import error as urlerror
 from urllib import parse as urlparse
 from urllib import request as urlrequest
@@ -285,6 +285,11 @@ def default_config() -> dict[str, Any]:
             "require_complete_product_ids_before_send": True,
             "require_all_stores_before_send": True,
         },
+        "production": {
+            "retry_failed_stores_enabled": True,
+            "retry_delay_seconds": 600,
+            "send_partial_with_failed_stores": True,
+        },
         "schedule": {
             "task_name": DEFAULT_TASK_NAME,
             "interval_hours": 6,
@@ -379,6 +384,46 @@ def connect_db(path: Path) -> sqlite3.Connection:
     )
     conn.commit()
     return conn
+
+
+NOTIFIED_ITEM_COLUMNS = [
+    "dedupe_key",
+    "content_hash",
+    "store",
+    "site",
+    "category",
+    "asin",
+    "sku",
+    "reason",
+    "issue_date",
+    "first_seen_at",
+    "last_seen_at",
+    "notified_at",
+    "notify_count",
+    "payload_json",
+]
+
+
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def insert_notified_item_row(conn: sqlite3.Connection, row: sqlite3.Row | dict[str, Any]) -> None:
+    values = [row[column] for column in NOTIFIED_ITEM_COLUMNS]
+    conn.execute(
+        """
+        INSERT INTO notified_items (
+            dedupe_key, content_hash, store, site, category, asin, sku, reason,
+            issue_date, first_seen_at, last_seen_at, notified_at, notify_count, payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        values,
+    )
 
 
 def configured_run_lock_ttl_minutes(config: dict[str, Any]) -> float:
@@ -821,9 +866,54 @@ def chunked(items: list[ImpactItem], size: int) -> list[list[ImpactItem]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
-def notification_title(now: datetime | None = None) -> str:
+def notification_title(now: datetime | None = None, suffix: str = "") -> str:
     current = now or datetime.now()
-    return f"{current.year}年{current.month}月{current.day}日亚马逊账号状况异常新增通知"
+    title = f"{current.year}年{current.month}月{current.day}日亚马逊账号状况异常新增通知"
+    suffix = clean_text(suffix)
+    if suffix:
+        return f"{title}{suffix}"
+    return title
+
+
+def ordered_unique_text(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = clean_text(value)
+        if not text:
+            continue
+        key = normalize_for_key(text)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result
+
+
+def compact_failure_reason(value: str, limit: int = 120) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def dedupe_failed_targets(failed_targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for target in failed_targets:
+        store = clean_text(target.get("store"))
+        site = clean_text(target.get("site") or SITE_US)
+        if not store:
+            continue
+        signature = (normalize_for_key(store), normalize_for_key(site))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.append(dict(target))
+    return result
 
 
 def _count_by(items: list[ImpactItem], field: str) -> dict[str, int]:
@@ -863,7 +953,14 @@ def render_dingtalk_issue_field_block(
     ]
 
 
-def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk_total: int) -> str:
+def render_markdown(
+    items: list[ImpactItem],
+    title: str,
+    chunk_index: int,
+    chunk_total: int,
+    failed_targets: list[dict[str, Any]] | None = None,
+) -> str:
+    failed_targets = dedupe_failed_targets(list(failed_targets or []))
     store_counts = _count_by(items, "store")
     category_counts = _count_by(items, "category")
     store_summary = ", ".join(f"{store} {count}条" for store, count in store_counts.items()) or "无"
@@ -877,6 +974,12 @@ def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk
         f"- 问题类型: {category_summary}",
         f"- 范围: {SITE_US}站, 未解决账号状况异常",
     ]
+    if failed_targets:
+        failed_store_names = ordered_unique_text([clean_text(item.get("store")) for item in failed_targets])
+        failed_store_summary = ", ".join(failed_store_names[:8])
+        if len(failed_store_names) > 8:
+            failed_store_summary = f"{failed_store_summary} 等 {len(failed_store_names)} 个"
+        lines.append(f"- 采集未完成店铺: {len(failed_store_names)} 个, {failed_store_summary}")
     if chunk_total > 1:
         lines.append(f"- 分段: {chunk_index}/{chunk_total}")
 
@@ -896,6 +999,23 @@ def render_markdown(items: list[ImpactItem], title: str, chunk_index: int, chunk
                 lines.extend(
                     render_dingtalk_issue_field_block(index, category, date_text, action_text, asin, sku)
                 )
+            lines.append("")
+    if failed_targets:
+        lines.extend(["", "---", "", "#### 未完成店铺"])
+        for index, target in enumerate(failed_targets, start=1):
+            store = clean_text(target.get("store")) or "未识别店铺"
+            site = clean_text(target.get("site") or SITE_US)
+            status = clean_text(target.get("status")) or "failed"
+            error = compact_failure_reason(
+                clean_text(target.get("error"))
+                or clean_text(target.get("coverage_error"))
+                or clean_text(target.get("reason"))
+                or "补采仍未成功"
+            )
+            lines.append(f"{index}. 店铺: {store} ({site})  ")
+            lines.append(f"   状态: {status}  ")
+            if error:
+                lines.append(f"   原因: {error}")
             lines.append("")
     return "\n".join(lines).strip() + "\n"
 
@@ -1840,6 +1960,7 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
     item_rows: list[dict[str, Any]] = []
     sent_items = 0
     candidates: list[ImpactItem] = []
+    failed_targets = dedupe_failed_targets(list(getattr(args, "failed_targets", []) or []))
     status = "success"
     error = ""
     coverage_summary: dict[str, Any] = {}
@@ -1882,11 +2003,17 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
             if not dry_run:
                 ensure_primary_host_allowed(config)
 
-            chunks = chunked(candidates, max_items)
-            title_base = notification_title()
+            chunks = chunked(candidates, max_items) if candidates else ([[]] if failed_targets else [])
+            title_base = notification_title(suffix="（部分成功）" if failed_targets else "")
             for index, chunk in enumerate(chunks, start=1):
                 title = title_base if len(chunks) == 1 else f"{title_base} ({index}/{len(chunks)})"
-                markdown = render_markdown(chunk, title, index, len(chunks))
+                markdown = render_markdown(
+                    chunk,
+                    title,
+                    index,
+                    len(chunks),
+                    failed_targets=failed_targets if index == 1 else [],
+                )
                 try:
                     result = send_dingtalk_markdown(config, state_dir, title, markdown, dry_run=dry_run)
                 except Exception as exc:
@@ -1906,7 +2033,9 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
                     break
 
             if status != "send_failed":
-                if not candidates:
+                if failed_targets:
+                    status = "partial_notice_dry_run" if dry_run else "partial_notice_sent"
+                elif not candidates:
                     status = "no_new_items"
                 elif dry_run:
                     status = "dry_run"
@@ -1960,7 +2089,7 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
             release_run_lock(lock_path)
 
     return {
-        "ok": status in {"success", "no_new_items", "dry_run"},
+        "ok": status in {"success", "no_new_items", "dry_run", "partial_notice_sent", "partial_notice_dry_run"},
         "status": status,
         "run_id": run_id,
         "source": source,
@@ -1970,6 +2099,7 @@ def execute_run(args: argparse.Namespace) -> dict[str, Any]:
         "artifact": str(artifact),
         "error": error,
         "coverage": coverage_summary,
+        "failed_targets": failed_targets,
     }
 
 
@@ -2036,6 +2166,88 @@ def execute_validate_config(args: argparse.Namespace) -> dict[str, Any]:
         require_source_excel=should_require_source_excel_for_runtime(config),
         require_collector_ready=should_require_collector_for_runtime(config),
     )
+
+
+def execute_merge_state(args: argparse.Namespace) -> dict[str, Any]:
+    config_path = Path(args.config or DEFAULT_CONFIG_PATH)
+    config = load_config(config_path) if config_path.is_file() else default_config()
+    state_dir = Path(args.state_dir or config_path.parent or DEFAULT_STATE_DIR)
+    source_db = Path(args.source_db).expanduser()
+    target_db = Path(args.target_db or config.get("state", {}).get("db_path") or state_dir / "state.sqlite").expanduser()
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    if not source_db.is_file():
+        return {
+            "ok": False,
+            "status": "source_missing",
+            "source_db": str(source_db),
+            "target_db": str(target_db),
+            "error": f"Source database not found: {source_db}",
+            "issues": [issue("source_db_missing", f"找不到源状态库: {source_db}")],
+        }
+    if source_db.resolve() == target_db.resolve():
+        return {
+            "ok": False,
+            "status": "invalid_args",
+            "source_db": str(source_db),
+            "target_db": str(target_db),
+            "error": "Source and target database paths are the same.",
+            "issues": [issue("state_db_same_path", "源状态库和目标状态库不能是同一路径")],
+        }
+
+    source_conn = sqlite3.connect(source_db)
+    source_conn.row_factory = sqlite3.Row
+    target_conn = connect_db(target_db)
+    inserted = 0
+    skipped_existing = 0
+    by_store_inserted: dict[str, int] = {}
+
+    try:
+        if not table_exists(source_conn, "notified_items"):
+            return {
+                "ok": False,
+                "status": "invalid_source",
+                "source_db": str(source_db),
+                "target_db": str(target_db),
+                "error": "Source database does not contain notified_items table.",
+                "issues": [issue("source_table_missing", "源状态库缺少 notified_items 表")],
+            }
+        source_rows = source_conn.execute(
+            f"SELECT {', '.join(NOTIFIED_ITEM_COLUMNS)} FROM notified_items ORDER BY notified_at, dedupe_key"
+        ).fetchall()
+        target_before = int(target_conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0])
+        for row in source_rows:
+            exists = target_conn.execute(
+                "SELECT 1 FROM notified_items WHERE dedupe_key = ?",
+                (row["dedupe_key"],),
+            ).fetchone()
+            if exists is not None:
+                skipped_existing += 1
+                continue
+            inserted += 1
+            store_name = clean_text(row["store"]) or "UNKNOWN"
+            by_store_inserted[store_name] = by_store_inserted.get(store_name, 0) + 1
+            if not dry_run:
+                insert_notified_item_row(target_conn, row)
+        if not dry_run:
+            target_conn.commit()
+        target_after = target_before + inserted if dry_run else int(target_conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0])
+    finally:
+        source_conn.close()
+        target_conn.close()
+
+    return {
+        "ok": True,
+        "status": "dry_run" if dry_run else "success",
+        "source_db": str(source_db),
+        "target_db": str(target_db),
+        "source_count": len(source_rows),
+        "target_count_before": target_before,
+        "inserted": inserted,
+        "skipped_existing": skipped_existing,
+        "target_count_after": target_after,
+        "by_store_inserted": by_store_inserted,
+    }
 
 
 def execute_cdp_smoke(args: argparse.Namespace) -> dict[str, Any]:
@@ -2222,6 +2434,251 @@ def cdp_target_result_rows(run_id: str, target_results: list[dict[str, Any]]) ->
             }
         )
     return rows
+
+
+def make_failed_target_result(
+    store: str,
+    site: str,
+    status: str,
+    error: str,
+    *,
+    started_at: str = "",
+    ended_at: str = "",
+) -> dict[str, Any]:
+    return {
+        "ok": False,
+        "status": clean_text(status) or "failed",
+        "store": clean_text(store),
+        "site": clean_text(site) or SITE_US,
+        "row_count": 0,
+        "error": clean_text(error),
+        "target": {"port": "", "id": "", "type": "", "title": "", "url": ""},
+        "page_reports": [],
+        "page_snapshot": {},
+        "debugging_port": 0,
+        "started_at": clean_text(started_at),
+        "ended_at": clean_text(ended_at),
+    }
+
+
+def payload_target_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [sanitized_target_result(result) for result in payload.get("target_results", [])]
+
+
+def payload_items(payload: dict[str, Any], source_file: str) -> list[ImpactItem]:
+    rows = payload.get("items") or []
+    items: list[ImpactItem] = []
+    for row in rows:
+        if isinstance(row, dict):
+            items.extend(item_from_detail_row(row, source_file))
+    return dedupe_items(items)
+
+
+def collection_retry_store_names(payload: dict[str, Any]) -> list[str]:
+    stores: list[str] = []
+    for result in payload_target_results(payload):
+        if result.get("ok"):
+            continue
+        stores.append(clean_text(result.get("store")))
+    for store in payload.get("missing_stores", []):
+        stores.append(clean_text(store))
+    return ordered_unique_text(stores)
+
+
+def collection_failed_targets(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    failed_targets = [result for result in payload_target_results(payload) if not result.get("ok")]
+    target_site = clean_text(payload.get("target_site")) or SITE_US
+    covered_keys = {
+        normalize_for_key(clean_text(result.get("store")))
+        for result in failed_targets
+        if clean_text(result.get("store"))
+    }
+    for store in payload.get("missing_stores", []):
+        store_name = clean_text(store)
+        if not store_name:
+            continue
+        key = normalize_for_key(store_name)
+        if key in covered_keys:
+            continue
+        failed_targets.append(
+            make_failed_target_result(
+                store_name,
+                target_site,
+                "missing",
+                "店铺未完成采集",
+            )
+        )
+        covered_keys.add(key)
+    return dedupe_failed_targets(failed_targets)
+
+
+def retry_failed_stores_enabled(config: dict[str, Any]) -> bool:
+    return bool(config.get("production", {}).get("retry_failed_stores_enabled", True))
+
+
+def production_retry_delay_seconds(config: dict[str, Any]) -> int:
+    raw = config.get("production", {}).get("retry_delay_seconds", 600)
+    try:
+        value = int(raw)
+    except Exception:
+        value = 600
+    return max(0, value)
+
+
+def send_partial_with_failed_stores(config: dict[str, Any]) -> bool:
+    return bool(config.get("production", {}).get("send_partial_with_failed_stores", True))
+
+
+def build_retry_target_results(
+    retry_payload: dict[str, Any],
+    retry_stores: list[str],
+) -> list[dict[str, Any]]:
+    results = payload_target_results(retry_payload)
+    existing_keys = {
+        normalize_for_key(clean_text(result.get("store")))
+        for result in results
+        if clean_text(result.get("store"))
+    }
+    target_site = clean_text(retry_payload.get("target_site")) or SITE_US
+    for store in retry_payload.get("missing_stores", []):
+        store_name = clean_text(store)
+        if not store_name:
+            continue
+        key = normalize_for_key(store_name)
+        if key in existing_keys:
+            continue
+        results.append(
+            make_failed_target_result(
+                store_name,
+                target_site,
+                "missing",
+                "店铺未完成采集",
+            )
+        )
+        existing_keys.add(key)
+    by_key = {
+        normalize_for_key(clean_text(result.get("store"))): result
+        for result in results
+        if clean_text(result.get("store"))
+    }
+    fallback_error = clean_text(
+        retry_payload.get("coverage_error")
+        or retry_payload.get("store_list_error")
+        or retry_payload.get("error")
+        or "补采仍未成功"
+    )
+    ordered_results: list[dict[str, Any]] = []
+    for store in retry_stores:
+        key = normalize_for_key(store)
+        result = by_key.get(key)
+        if result:
+            ordered_results.append(result)
+        else:
+            ordered_results.append(
+                make_failed_target_result(
+                    store,
+                    target_site,
+                    "retry_failed",
+                    fallback_error,
+                )
+            )
+    return ordered_results
+
+
+def merge_collection_payloads(
+    primary: dict[str, Any],
+    retry: dict[str, Any],
+    retry_stores: list[str],
+    result_dir: Path,
+) -> dict[str, Any]:
+    run_id = run_id_text()
+    backend = clean_text(primary.get("backend") or retry.get("backend") or "webdriver")
+    target_site = clean_text(primary.get("target_site") or retry.get("target_site") or SITE_US) or SITE_US
+    expected_stores = ordered_unique_text(
+        list(primary.get("opened_stores", []))
+        + list(primary.get("missing_stores", []))
+        + list(retry.get("opened_stores", []))
+        + list(retry.get("missing_stores", []))
+    )
+    retry_store_keys = {normalize_for_key(store) for store in retry_stores if clean_text(store)}
+    primary_target_results = payload_target_results(primary)
+    merged_target_results = [
+        result
+        for result in primary_target_results
+        if normalize_for_key(clean_text(result.get("store"))) not in retry_store_keys
+    ]
+    merged_target_results.extend(build_retry_target_results(retry, retry_stores))
+
+    primary_items = payload_items(primary, str(primary.get("artifact") or "primary-collection"))
+    retry_items = payload_items(retry, str(retry.get("artifact") or "retry-collection"))
+    merged_items = dedupe_items(
+        [
+            item
+            for item in primary_items
+            if normalize_for_key(item.store) not in retry_store_keys
+        ]
+        + retry_items
+    )
+
+    summary = cdp_open_summary(
+        merged_items,
+        expected_stores=expected_stores,
+        target_results=merged_target_results,
+        target_site=target_site,
+        store_list_path=clean_text(primary.get("store_list_path") or retry.get("store_list_path")),
+        store_list_error=clean_text(primary.get("store_list_error") or retry.get("store_list_error")),
+    )
+    target_failures = [result for result in merged_target_results if not result.get("ok")]
+    if not merged_target_results:
+        status = "no_targets"
+    elif target_failures:
+        status = "partial_failed"
+    elif summary.get("missing_stores"):
+        status = "partial"
+    else:
+        status = "success"
+    ok = bool(merged_target_results) and not target_failures and not summary.get("missing_stores")
+
+    artifact = result_dir / f"account-health-{backend}-stores-merged-{run_id}.xlsx"
+    item_rows = [item.to_row(run_id, f"{backend}_collected") for item in merged_items]
+    target_rows = cdp_target_result_rows(run_id, merged_target_results)
+    write_collect_open_xlsx(artifact, item_rows, target_rows, summary)
+
+    json_artifact = result_dir / f"account-health-{backend}-stores-merged-{run_id}.json"
+    json_artifact.parent.mkdir(parents=True, exist_ok=True)
+    json_payload = {
+        "run_id": run_id,
+        "status": status,
+        "backend": backend,
+        "start_date": primary.get("start_date") or retry.get("start_date") or "",
+        "end_date": primary.get("end_date") or retry.get("end_date") or "",
+        "target_site": target_site,
+        "row_count": len(merged_items),
+        "target_count": len(merged_target_results),
+        "target_results": merged_target_results,
+        "missing_stores": summary.get("missing_stores", []),
+        "opened_stores": summary.get("opened_stores", []),
+        "rows": item_rows,
+    }
+    json_artifact.write_text(json.dumps(json_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    payload = {
+        "ok": ok,
+        "status": status,
+        "backend": backend,
+        "run_id": run_id,
+        "start_date": primary.get("start_date") or retry.get("start_date") or "",
+        "end_date": primary.get("end_date") or retry.get("end_date") or "",
+        "target_site": target_site,
+        "row_count": len(merged_items),
+        "target_count": len(merged_target_results),
+        "artifact": str(artifact),
+        "json_artifact": str(json_artifact),
+        "target_results": merged_target_results,
+        **summary,
+        "items": item_rows,
+    }
+    return payload
 
 
 def load_cdp_expected_stores(
@@ -2622,6 +3079,11 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
     config_path = Path(getattr(args, "config", str(DEFAULT_CONFIG_PATH)))
     config = load_config(config_path) if config_path.is_file() else default_config()
     backend = collector_backend_name(config, getattr(args, "backend", ""))
+    result_dir = Path(
+        getattr(args, "output_dir", "")
+        or config.get("state", {}).get("result_dir")
+        or DEFAULT_STATE_DIR / "runs"
+    )
     collect_args = argparse.Namespace(
         config=str(config_path),
         state_dir=getattr(args, "state_dir", ""),
@@ -2638,12 +3100,13 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
         exec_timeout=int(getattr(args, "exec_timeout", 0) or 0),
         keep_open=bool(getattr(args, "keep_open", False)),
         output_dir=getattr(args, "output_dir", ""),
-        include_items=False,
+        include_items=True,
     )
+    collector_fn: Callable[[argparse.Namespace], dict[str, Any]]
     if backend == "webdriver":
-        collection = execute_webdriver_collect_stores(collect_args)
+        collector_fn = execute_webdriver_collect_stores
     elif backend == "zclaw":
-        collection = execute_zclaw_collect_stores(collect_args)
+        collector_fn = execute_zclaw_collect_stores
     else:
         return {
             "ok": False,
@@ -2667,29 +3130,59 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
             "error": f"Unsupported collector backend: {backend}",
             "collection": {},
         }
-    source_excel = clean_text(collection.get("artifact"))
-    if not collection.get("ok") or not source_excel:
+    initial_collection = collector_fn(collect_args)
+    final_collection = initial_collection
+    retry_collection: dict[str, Any] = {}
+    retry_stores = collection_retry_store_names(initial_collection)
+    retry_info = {
+        "attempted": False,
+        "retry_delay_seconds": 0,
+        "retry_stores": retry_stores,
+        "retry_status": "skipped",
+        "remaining_failed_stores": retry_stores,
+    }
+    if retry_failed_stores_enabled(config) and retry_stores:
+        retry_info["attempted"] = True
+        retry_delay_seconds = production_retry_delay_seconds(config)
+        retry_info["retry_delay_seconds"] = retry_delay_seconds
+        if retry_delay_seconds > 0:
+            time.sleep(retry_delay_seconds)
+        retry_args = argparse.Namespace(**vars(collect_args))
+        retry_args.stores = ",".join(retry_stores)
+        retry_args.limit = 0
+        retry_collection = collector_fn(retry_args)
+        retry_info["retry_status"] = clean_text(retry_collection.get("status")) or "unknown"
+        final_collection = merge_collection_payloads(initial_collection, retry_collection, retry_stores, result_dir)
+        retry_info["remaining_failed_stores"] = collection_retry_store_names(final_collection)
+
+    source_excel = clean_text(final_collection.get("artifact"))
+    final_failed_targets = collection_failed_targets(final_collection)
+    allow_partial_send = bool(source_excel) and bool(final_failed_targets) and send_partial_with_failed_stores(config)
+    if (not final_collection.get("ok") and not allow_partial_send) or not source_excel:
         return {
             "ok": False,
             "status": "collect_failed",
-            "collection_status": collection.get("status", "unknown"),
+            "collection_status": final_collection.get("status", "unknown"),
             "notification_status": "skipped",
             "backend": backend,
-            "collection_run_id": collection.get("run_id", ""),
-            "start_date": collection.get("start_date", ""),
-            "end_date": collection.get("end_date", ""),
-            "target_site": collection.get("target_site", ""),
-            "target_count": collection.get("target_count", 0),
-            "row_count": collection.get("row_count", 0),
+            "collection_run_id": final_collection.get("run_id", ""),
+            "start_date": final_collection.get("start_date", ""),
+            "end_date": final_collection.get("end_date", ""),
+            "target_site": final_collection.get("target_site", ""),
+            "target_count": final_collection.get("target_count", 0),
+            "row_count": final_collection.get("row_count", 0),
             "source_excel": source_excel,
             "collect_artifact": source_excel,
-            "collect_json_artifact": collection.get("json_artifact", ""),
+            "collect_json_artifact": final_collection.get("json_artifact", ""),
             "notify_artifact": "",
             "total_items": 0,
             "notify_candidates": 0,
             "sent_items": 0,
-            "error": collection.get("coverage_error") or collection.get("error") or "ZClaw collection did not cover all target stores.",
-            "collection": collection,
+            "error": final_collection.get("coverage_error") or final_collection.get("error") or "Collection did not cover all target stores.",
+            "collection": final_collection,
+            "initial_collection": initial_collection,
+            "retry_collection": retry_collection,
+            "retry": retry_info,
         }
 
     notify_args = argparse.Namespace(
@@ -2698,40 +3191,47 @@ def execute_production_run(args: argparse.Namespace) -> dict[str, Any]:
         source_type="excel",
         source_excel=source_excel,
         source_dir="",
-        site=collection.get("target_site") or getattr(args, "site", "") or SITE_US,
+        site=final_collection.get("target_site") or getattr(args, "site", "") or SITE_US,
         store_list="",
-        require_all_stores=True,
-        skip_store_coverage=False,
+        require_all_stores=not allow_partial_send,
+        skip_store_coverage=allow_partial_send,
         dry_run=bool(getattr(args, "dry_run", False)),
         send=bool(getattr(args, "send", False)),
+        failed_targets=final_failed_targets if allow_partial_send else [],
     )
     notification = execute_run(notify_args)
     notification_status = clean_text(notification.get("status")) or "unknown"
     ok = bool(notification.get("ok"))
-    status = notification_status if ok else f"notify_{notification_status}"
+    if ok and allow_partial_send:
+        status = "partial_success"
+    else:
+        status = notification_status if ok else f"notify_{notification_status}"
     return {
         "ok": ok,
         "status": status,
         "backend": backend,
-        "collection_status": collection.get("status", "unknown"),
+        "collection_status": final_collection.get("status", "unknown"),
         "notification_status": notification_status,
-        "collection_run_id": collection.get("run_id", ""),
+        "collection_run_id": final_collection.get("run_id", ""),
         "notification_run_id": notification.get("run_id", ""),
-        "start_date": collection.get("start_date", ""),
-        "end_date": collection.get("end_date", ""),
-        "target_site": collection.get("target_site", ""),
-        "target_count": collection.get("target_count", 0),
-        "row_count": collection.get("row_count", 0),
+        "start_date": final_collection.get("start_date", ""),
+        "end_date": final_collection.get("end_date", ""),
+        "target_site": final_collection.get("target_site", ""),
+        "target_count": final_collection.get("target_count", 0),
+        "row_count": final_collection.get("row_count", 0),
         "source_excel": source_excel,
         "collect_artifact": source_excel,
-        "collect_json_artifact": collection.get("json_artifact", ""),
+        "collect_json_artifact": final_collection.get("json_artifact", ""),
         "notify_artifact": notification.get("artifact", ""),
         "total_items": notification.get("total_items", 0),
         "notify_candidates": notification.get("notify_candidates", 0),
         "sent_items": notification.get("sent_items", 0),
         "error": notification.get("error", ""),
         "coverage": notification.get("coverage", {}),
-        "collection": collection,
+        "collection": final_collection,
+        "initial_collection": initial_collection,
+        "retry_collection": retry_collection,
+        "retry": retry_info,
         "notification": notification,
     }
 
@@ -2990,6 +3490,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(validate_config)
     validate_config.add_argument("--require-send-ready", action="store_true", help="要求机器人和群配置已满足真实通知")
     validate_config.set_defaults(func=execute_validate_config)
+
+    merge_state = sub.add_parser("merge-state", help="合并旧机器或旧目录中的已通知历史库")
+    add_common(merge_state)
+    merge_state.add_argument("--source-db", required=True, help="源状态库路径")
+    merge_state.add_argument("--target-db", default="", help="目标状态库路径, 默认使用当前配置 state.db_path")
+    merge_state.add_argument("--dry-run", action="store_true", help="只预览将导入多少条历史记录")
+    merge_state.set_defaults(func=execute_merge_state)
 
     run = sub.add_parser("run", help="执行采集、去重和通知")
     add_common(run)

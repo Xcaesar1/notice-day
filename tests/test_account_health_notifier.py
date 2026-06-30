@@ -894,6 +894,27 @@ class NotificationRenderingTests(unittest.TestCase):
         self.assertNotIn("过去 12 个月无销量", markdown)
         self.assertNotIn("评级影响", markdown)
 
+    def test_render_markdown_appends_failed_store_section(self) -> None:
+        markdown = notifier.render_markdown(
+            self._items()[:1],
+            "2026年6月26日亚马逊账号状况异常新增通知（部分成功）",
+            1,
+            1,
+            failed_targets=[
+                {
+                    "store": "Hanallx",
+                    "site": notifier.SITE_US,
+                    "status": "retry_failed",
+                    "error": "登录校验超时",
+                }
+            ],
+        )
+
+        self.assertIn("#### 未完成店铺", markdown)
+        self.assertIn("1. 店铺: Hanallx (美国)", markdown)
+        self.assertIn("状态: retry_failed", markdown)
+        self.assertIn("原因: 登录校验超时", markdown)
+
 
 class RunCoverageGuardTests(unittest.TestCase):
     def test_run_all_14_us_stores_allows_dry_run_without_marking_notified(self) -> None:
@@ -1458,9 +1479,34 @@ class ProductionRunTests(unittest.TestCase):
             send=send,
         )
 
+    def _write_config(self, root: Path, backend: str = "webdriver") -> Path:
+        config = notifier.default_config()
+        config["collector"]["backend"] = backend
+        config["production"]["retry_delay_seconds"] = 0
+        config["source"]["store_list_path"] = str(root / "stores.xlsx")
+        config["state"]["db_path"] = str(root / "state.sqlite")
+        config["state"]["result_dir"] = str(root / "runs")
+        config_path = root / "config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+        return config_path
+
+    def _detail_row(self, store: str, asin: str, sku: str) -> dict[str, str]:
+        return {
+            "店铺": store,
+            "站点": notifier.SITE_US,
+            "异常分类": "食品和商品安全问题",
+            "原因": "安全饮用水法案",
+            "日期": "2026年6月29日",
+            "哪些商品会受到影响？": f"ASIN: {asin} SKU: {sku}",
+            "存在销售风险": "过去 12 个月无销量",
+            "采取的操作": "商品已移除",
+            "账户状况评级影响": "无影响",
+        }
+
     def test_production_run_collects_then_notifies_from_generated_excel(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            self._write_config(root, backend="zclaw")
             collection = {
                 "ok": True,
                 "status": "success",
@@ -1499,6 +1545,7 @@ class ProductionRunTests(unittest.TestCase):
             self.assertEqual(collect_args.stores, "BYF,Hangoro")
             self.assertEqual(collect_args.limit, 2)
             self.assertEqual(collect_args.output_dir, str(root / "runs"))
+            self.assertTrue(collect_args.include_items)
             run_args = run_mock.call_args.args[0]
             self.assertEqual(run_args.source_type, "excel")
             self.assertEqual(run_args.source_excel, collection["artifact"])
@@ -1506,10 +1553,12 @@ class ProductionRunTests(unittest.TestCase):
             self.assertFalse(run_args.skip_store_coverage)
             self.assertTrue(run_args.dry_run)
             self.assertFalse(run_args.send)
+            self.assertEqual(run_args.failed_targets, [])
 
     def test_production_run_blocks_notification_when_collection_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            self._write_config(root, backend="zclaw")
             collection = {
                 "ok": False,
                 "status": "partial_failed",
@@ -1534,6 +1583,157 @@ class ProductionRunTests(unittest.TestCase):
             self.assertEqual(result["notification_status"], "skipped")
             self.assertEqual(result["error"], "missing stores: Hanallx")
             run_mock.assert_not_called()
+
+    def test_production_run_retries_failed_store_then_notifies_merged_result(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_config(root, backend="webdriver")
+            first_collection = {
+                "ok": False,
+                "status": "partial_failed",
+                "backend": "webdriver",
+                "run_id": "collect-1",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-30",
+                "target_site": notifier.SITE_US,
+                "target_count": 2,
+                "row_count": 1,
+                "artifact": str(root / "runs" / "first.xlsx"),
+                "json_artifact": str(root / "runs" / "first.json"),
+                "target_results": [
+                    {"ok": True, "status": "success", "store": "BYF", "site": notifier.SITE_US, "row_count": 1, "error": "", "target": {}},
+                    {"ok": False, "status": "failed", "store": "Hangoro", "site": notifier.SITE_US, "row_count": 0, "error": "timeout", "target": {}},
+                ],
+                "opened_stores": ["BYF"],
+                "missing_stores": ["Hangoro"],
+                "store_list_path": str(root / "stores.xlsx"),
+                "store_list_error": "",
+                "items": [self._detail_row("BYF", "B0BYF00001", "BYF-SKU-1")],
+            }
+            retry_collection = {
+                "ok": True,
+                "status": "success",
+                "backend": "webdriver",
+                "run_id": "collect-2",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-30",
+                "target_site": notifier.SITE_US,
+                "target_count": 1,
+                "row_count": 1,
+                "artifact": str(root / "runs" / "retry.xlsx"),
+                "json_artifact": str(root / "runs" / "retry.json"),
+                "target_results": [
+                    {"ok": True, "status": "success", "store": "Hangoro", "site": notifier.SITE_US, "row_count": 1, "error": "", "target": {}},
+                ],
+                "opened_stores": ["Hangoro"],
+                "missing_stores": [],
+                "store_list_path": str(root / "stores.xlsx"),
+                "store_list_error": "",
+                "items": [self._detail_row("Hangoro", "B0HAN00001", "HAN-SKU-1")],
+            }
+            notification = {
+                "ok": True,
+                "status": "dry_run",
+                "run_id": "notify-1",
+                "artifact": str(root / "runs" / "notify.xlsx"),
+                "total_items": 2,
+                "notify_candidates": 2,
+                "sent_items": 0,
+                "coverage": {"coverage_ok": True},
+                "error": "",
+            }
+
+            with mock.patch.object(notifier, "execute_webdriver_collect_stores", side_effect=[first_collection, retry_collection]) as collect_mock:
+                with mock.patch.object(notifier, "execute_run", return_value=notification) as run_mock:
+                    result = notifier.execute_production_run(self._args(root))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "dry_run")
+            self.assertEqual(result["collection_status"], "success")
+            self.assertTrue(result["retry"]["attempted"])
+            self.assertEqual(result["retry"]["retry_status"], "success")
+            self.assertEqual(result["retry"]["remaining_failed_stores"], [])
+            self.assertEqual(collect_mock.call_count, 2)
+            self.assertEqual(collect_mock.call_args_list[1].args[0].stores, "Hangoro")
+            self.assertEqual(collect_mock.call_args_list[1].args[0].limit, 0)
+            run_args = run_mock.call_args.args[0]
+            self.assertIn("merged", Path(run_args.source_excel).name)
+            self.assertFalse(run_args.skip_store_coverage)
+            self.assertTrue(run_args.require_all_stores)
+            self.assertEqual(run_args.failed_targets, [])
+
+    def test_production_run_sends_partial_notice_after_retry_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            self._write_config(root, backend="webdriver")
+            first_collection = {
+                "ok": False,
+                "status": "partial_failed",
+                "backend": "webdriver",
+                "run_id": "collect-1",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-30",
+                "target_site": notifier.SITE_US,
+                "target_count": 2,
+                "row_count": 1,
+                "artifact": str(root / "runs" / "first.xlsx"),
+                "json_artifact": str(root / "runs" / "first.json"),
+                "target_results": [
+                    {"ok": True, "status": "success", "store": "BYF", "site": notifier.SITE_US, "row_count": 1, "error": "", "target": {}},
+                    {"ok": False, "status": "failed", "store": "Hangoro", "site": notifier.SITE_US, "row_count": 0, "error": "timeout", "target": {}},
+                ],
+                "opened_stores": ["BYF"],
+                "missing_stores": ["Hangoro"],
+                "store_list_path": str(root / "stores.xlsx"),
+                "store_list_error": "",
+                "items": [self._detail_row("BYF", "B0BYF00001", "BYF-SKU-1")],
+            }
+            retry_collection = {
+                "ok": False,
+                "status": "partial_failed",
+                "backend": "webdriver",
+                "run_id": "collect-2",
+                "start_date": "2026-06-01",
+                "end_date": "2026-06-30",
+                "target_site": notifier.SITE_US,
+                "target_count": 0,
+                "row_count": 0,
+                "artifact": str(root / "runs" / "retry.xlsx"),
+                "json_artifact": str(root / "runs" / "retry.json"),
+                "target_results": [],
+                "opened_stores": [],
+                "missing_stores": ["Hangoro"],
+                "store_list_path": str(root / "stores.xlsx"),
+                "store_list_error": "",
+                "error": "login timeout",
+                "items": [],
+            }
+            notification = {
+                "ok": True,
+                "status": "partial_notice_dry_run",
+                "run_id": "notify-1",
+                "artifact": str(root / "runs" / "notify.xlsx"),
+                "total_items": 1,
+                "notify_candidates": 1,
+                "sent_items": 0,
+                "coverage": {"coverage_ok": False},
+                "error": "",
+            }
+
+            with mock.patch.object(notifier, "execute_webdriver_collect_stores", side_effect=[first_collection, retry_collection]):
+                with mock.patch.object(notifier, "execute_run", return_value=notification) as run_mock:
+                    result = notifier.execute_production_run(self._args(root))
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "partial_success")
+            self.assertEqual(result["notification_status"], "partial_notice_dry_run")
+            self.assertTrue(result["retry"]["attempted"])
+            self.assertEqual(result["retry"]["remaining_failed_stores"], ["Hangoro"])
+            run_args = run_mock.call_args.args[0]
+            self.assertTrue(run_args.skip_store_coverage)
+            self.assertFalse(run_args.require_all_stores)
+            self.assertEqual(len(run_args.failed_targets), 1)
+            self.assertEqual(run_args.failed_targets[0]["store"], "Hangoro")
 
     def test_run_blocks_real_send_when_current_host_is_not_primary_host(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1578,6 +1778,52 @@ class ProductionRunTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(attempt_count, 0)
             self.assertEqual(notified_count, 0)
+
+    def test_run_sends_partial_notice_when_only_failed_targets_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config = notifier.default_config()
+            config["source"]["type"] = "sample"
+            config["notify"]["require_all_stores_before_send"] = False
+            config["state"]["db_path"] = str(root / "state.sqlite")
+            config["state"]["result_dir"] = str(root / "runs")
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(config_path),
+                state_dir=str(root),
+                source_type="sample",
+                source_excel="",
+                source_dir="",
+                site=notifier.SITE_US,
+                store_list="",
+                require_all_stores=False,
+                skip_store_coverage=True,
+                dry_run=True,
+                send=False,
+                failed_targets=[
+                    {
+                        "store": "Hangoro",
+                        "site": notifier.SITE_US,
+                        "status": "retry_failed",
+                        "error": "登录校验超时",
+                    }
+                ],
+            )
+
+            with mock.patch.object(notifier, "load_items", return_value=([], "empty.xlsx")):
+                with mock.patch.object(notifier, "build_coverage_summary", return_value={"coverage_ok": True}):
+                    with mock.patch.object(
+                        notifier,
+                        "send_dingtalk_markdown",
+                        return_value=mock.Mock(returncode=0, stdout="", stderr=""),
+                    ) as send_mock:
+                        result = notifier.execute_run(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "partial_notice_dry_run")
+            self.assertEqual(result["notify_candidates"], 0)
+            self.assertEqual(send_mock.call_count, 1)
 
 
 class ConfigValidationTests(unittest.TestCase):
@@ -2063,6 +2309,97 @@ class SendSuccessTests(unittest.TestCase):
                 conn.close()
             self.assertEqual(notified_count, 1)
             self.assertEqual(sent_attempts, 1)
+
+
+class MergeStateTests(unittest.TestCase):
+    def test_merge_state_imports_missing_keys_without_overwriting_existing_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source_db = root / "source.sqlite"
+            target_db = root / "target.sqlite"
+            source_conn = notifier.connect_db(source_db)
+            target_conn = notifier.connect_db(target_db)
+            try:
+                shared = notifier.ImpactItem(
+                    store="Artiqua",
+                    site=notifier.SITE_US,
+                    category="违反受限商品政策",
+                    asin="B0SHARED",
+                    sku="SKU-SHARED",
+                    reason="3P Penalty Recovery violation",
+                    date="2026年6月14日",
+                    impacted_text="ASIN: B0SHARED SKU: SKU-SHARED",
+                    sales_risk="过去 12 个月无销量",
+                    action="已发送警告",
+                    rating_impact="无影响",
+                )
+                source_only = notifier.ImpactItem(
+                    store="Soebiz",
+                    site=notifier.SITE_US,
+                    category="食品和商品安全问题",
+                    asin="B0SOURCE",
+                    sku="SKU-SOURCE",
+                    reason="安全饮用水法案（SDWA）: 食品和商品安全问题",
+                    date="2026年6月10日",
+                    impacted_text="ASIN: B0SOURCE SKU: SKU-SOURCE",
+                    sales_risk="过去 12 个月无销量",
+                    action="商品已移除",
+                    rating_impact="无影响",
+                )
+                target_only = notifier.ImpactItem(
+                    store="Wowkk",
+                    site=notifier.SITE_US,
+                    category="违反受限商品政策",
+                    asin="B0TARGET",
+                    sku="SKU-TARGET",
+                    reason="3P Penalty Recovery violation",
+                    date="2026年6月15日",
+                    impacted_text="ASIN: B0TARGET SKU: SKU-TARGET",
+                    sales_risk="过去 12 个月无销量",
+                    action="已发送警告",
+                    rating_impact="无影响",
+                )
+
+                notifier.mark_notified(source_conn, [shared, source_only], "2026-06-26 14:16:47")
+                notifier.mark_notified(target_conn, [shared, target_only], "2026-06-30 09:18:32")
+            finally:
+                source_conn.close()
+                target_conn.close()
+
+            args = argparse.Namespace(
+                config=str(root / "missing-config.json"),
+                state_dir=str(root),
+                source_db=str(source_db),
+                target_db=str(target_db),
+                dry_run=False,
+                json=False,
+            )
+            result = notifier.execute_merge_state(args)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["source_count"], 2)
+            self.assertEqual(result["inserted"], 1)
+            self.assertEqual(result["skipped_existing"], 1)
+            self.assertEqual(result["by_store_inserted"], {"Soebiz": 1})
+
+            conn = notifier.connect_db(target_db)
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM notified_items").fetchone()[0]
+                source_only_row = conn.execute(
+                    "SELECT notified_at FROM notified_items WHERE dedupe_key = ?",
+                    (source_only.dedupe_key,),
+                ).fetchone()
+                shared_row = conn.execute(
+                    "SELECT notified_at FROM notified_items WHERE dedupe_key = ?",
+                    (shared.dedupe_key,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+            self.assertEqual(count, 3)
+            self.assertEqual(source_only_row["notified_at"], "2026-06-26 14:16:47")
+            self.assertEqual(shared_row["notified_at"], "2026-06-30 09:18:32")
 
 
 class ZiniaoWebdriverTests(unittest.TestCase):
